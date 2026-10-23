@@ -1,6 +1,6 @@
 # instabox-keepalive
 
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库用官方的 **activity lease** 定期续租，让它一直醒着；实现是一个 **Cloudflare Worker**：cron 每 9 分钟续一次租，不需要你自己的机器常开，一个 Worker 还能同时带多个账号。
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库用官方的 **activity lease** 定期续租，让它一直醒着；实现是一个 **Cloudflare Worker**：cron 每 5 分钟续一次租，不需要你自己的机器常开，一个 Worker 还能同时带多个账号。
 
 代码只有两个文件：`worker/worker.js`（全部逻辑）和 `worker/wrangler.toml`（CLI 部署配置）。
 
@@ -20,14 +20,14 @@
    | `TOKEN` | Secret（自己起一串随机值） | 之后所有请求都要带 `?token=` |
    | `INSTABOX_MACHINE` | Text | 留空 = 保活该 key 名下全部机器；填 `qqq` 只保一台（多台用逗号分隔） |
    | `INSTABOX_LEASE` | Text | `keepalive`（可选） |
-   | `INSTABOX_LEASE_TTL` | Text | `900`（建议；不填默认 300，会比 cron 间隔小） |
+   | `INSTABOX_LEASE_TTL` | Text | `900`（默认）。要比 cron 间隔大：`*/5` 下填 `300` 正好卡在边界，没余量 |
    | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
    | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先 `resume`（stopped 用 `start` 兜底）再续租；设 `0` 只报错不唤醒 |
    | `INSTABOX_CYCLE` | Text | 留空（默认）= **关，行为和老版本一致**：只续租 + 409 自动恢复，绝不主动重启。设 `1` 才开启轮转；设 `0` 也等于关 |
    | `INSTABOX_CYCLE_MARGIN_MIN` | Text | `20`（默认）。提前多少分钟开始轮转；机器多要调大（每轮只轮转一台，至少 ≥ cron 间隔 × 机器数）；设 `0` 关掉兜底轮转 |
    | `INSTABOX_CYCLE_AT` | Text | 留空（默认）= 不定时。填 `02:00,08:00,14:00,20:00` 就只在到点后轮转，方便知道重启落在哪个时间段 |
    | `INSTABOX_CYCLE_TZ` | Text | `Asia/Shanghai`（默认）。`INSTABOX_CYCLE_AT` 用的时区 |
-   | `INSTABOX_CYCLE_WINDOW_MIN` | Text | `30`（默认）。到点后多少分钟内允许触发（cron 9 分钟一轮 = 3 次机会） |
+   | `INSTABOX_CYCLE_WINDOW_MIN` | Text | `30`（默认）。到点后多少分钟内允许触发（cron 5 分钟一轮 = 6 次机会） |
    | `INSTABOX_PEAK_HOURS` | Text | 留空（默认）。填 `10-12,14-18,20-23` 就自动排重启点（全在高峰之外、间隔 ≤7h）；`INSTABOX_CYCLE_AT` 优先于它 |
    | `INSTABOX_CYCLE_JITTER_MIN` | Text | `0-0`（默认）。时间点抖动：到点后随机延迟这么多分钟才执行，比如 `0-15` |
    | `INSTABOX_CYCLE_HOLD_SEC` | Text | `0-0`（默认）。主动轮转时 suspend 后停几秒再 resume，比如 `30-90` |
@@ -35,8 +35,8 @@
    | `INSTABOX_API_URL` | Text | `https://api.instabox.sh`（换私有网关时才用加这个变量） |
 
    > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
-   > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 9 分钟就填 `900`，填 `300` 会在两次续租之间出现空窗。
-4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/9 * * * *`（每 9 分钟）→ 保存。这就是自动保活的开关
+   > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 5 分钟填 `900` 就有 3 倍余量，填 `300` 会在两次续租之间出现空窗。
+4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/5 * * * *`（每 5 分钟）→ 保存。这就是自动保活的开关
 5. 想看 `/log`：`Storage & Databases` → `KV` → `Create namespace`，然后在 Worker 的 `Settings` → `Bindings` 里加一个 KV 绑定，**变量名填 `LOG`**、选刚建的空间。不绑也能用，只是 `/log` 是空的
 
 **机器筛选**
@@ -89,7 +89,7 @@
 | `INSTABOX_LEASE_TTL` | Text | `900` |
 | `INSTABOX_LOG_MODE` | Text | `hourly` |
 
-`INSTABOX_MACHINE` / `INSTABOX_LEASE` / `INSTABOX_AUTO_RESUME` 都不写，效果就是：每个账号保活自己名下**全部机器**、租约名 `keepalive`、碰到挂起/停掉自动唤醒。cron 填 `*/9 * * * *`。
+`INSTABOX_MACHINE` / `INSTABOX_LEASE` / `INSTABOX_AUTO_RESUME` 都不写，效果就是：每个账号保活自己名下**全部机器**、租约名 `keepalive`、碰到挂起/停掉自动唤醒。cron 填 `*/5 * * * *`。
 
 反过来，如果几个账号都只想保活同名的那台机器（比如都叫 `qqq`），只写一个 `INSTABOX_MACHINE=qqq` 就行，所有账号都会继承这个筛选。
 
@@ -303,11 +303,14 @@ https://<你的worker>.workers.dev/status?token=xxx&account=2   只看 2 号账�
 
 | cron 间隔 | 次数/天 | `every` 模式写/天 | `hourly` 模式写/天 |
 | --- | --- | --- | --- |
-| `*/9` | 160 | 160 | ~24 |
-| `*/4` | 360 | 360 | ~24 |
-| `* * * * *` | 1440 | **1440（超了）** | ~24 |
+| `* * * * *`（1 分钟） | 1440 | **1440（超 1000 额度）** | ~24 |
+| `*/2`（2 分钟） | 720 | 720（72%） | ~24 |
+| `*/5`（**当前默认**） | 288 | 288（28.8%） | ~24 |
+| `*/9`（旧默认） | 160 | 160（16%） | ~24 |
 
-也就是说：间隔 4 分钟以上用默认值随便跑；间隔 1 分钟的 `every` 会超额度，这时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
+当前用的是 `*/5` + `hourly`：**每天约 24 次写，占额度 2.4%**，比 `*/9` 时代完全没变——续租更勤只影响读请求和子请求，不影响 KV 写。
+
+`hourly` 模式下无论 cron 多密都是每天 ~24 次写；只有切成 `every` 才会跟着间隔线性涨：`*/5` 是 288 次（28.8%，够用），1 分钟就是 1440 次直接超额度，那时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
 
 ## CLI 部署（可选）
 
@@ -318,7 +321,7 @@ npx wrangler secret put INSTABOX_API_KEY_2     # 2 号账号，要几个加几�
 npx wrangler deploy
 ```
 
-`worker/wrangler.toml` 里已经设好 `crons = ["*/9 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
+`worker/wrangler.toml` 里已经设好 `crons = ["*/5 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
 
 
 ## 免责声明

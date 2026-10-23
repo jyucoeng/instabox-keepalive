@@ -54,7 +54,7 @@
 // 注意：平台那 10 分钟冷却本身改不了（服务端行为），能加的只是"结束后多等一会儿"。
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
-const TTL_DEFAULT = 300;
+const TTL_DEFAULT = 900; // 要比 cron 间隔大；*/5 下 300 正好卡在边界，900 有 3 倍余量
 
 function clampTtl(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
