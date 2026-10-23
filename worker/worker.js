@@ -8,8 +8,9 @@
 //   INSTABOX_API_KEY_2    2 号账号的 key
 //   INSTABOX_API_KEY_3    3 号账号的 key ……
 //
-// 向后兼容：INSTABOX_CYCLE / INSTABOX_CYCLE_AT / INSTABOX_PEAK_HOURS 一个都不设时，
-// 行为和旧版本完全一致 —— 只续租 + 409 自动唤醒，不会主动 suspend/resume。想开检修轮转再逐个加。
+// 检修轮转默认开：INSTABOX_CYCLE_AT 不写就用 DEFAULT_CYCLE_AT（01:30/08:00/13:00/19:00），
+// 写了 INSTABOX_PEAK_HOURS 就按高峰自动排，两者都写则 CYCLE_AT 优先。
+// 只有显式 INSTABOX_CYCLE=0（或 off/false/no）才彻底关掉轮转，回到「只续租 + 409 自动唤醒」。
 //
 // 每个账号还可以单独覆盖 INSTABOX_MACHINE_2 / INSTABOX_LEASE_2 /
 // INSTABOX_LEASE_TTL_2 / INSTABOX_AUTO_RESUME_2 / INSTABOX_CYCLE_2 /
@@ -55,6 +56,8 @@
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 900; // 要比 cron 间隔大；*/5 下 300 正好卡在边界，900 有 3 倍余量
+// 检修轮转默认开着：没写 INSTABOX_CYCLE_AT 就用这套（间隔 6.5/5/6/6.5 小时，都小于 8 小时上限）。
+const DEFAULT_CYCLE_AT = "01:30,08:00,13:00,19:00";
 
 function clampTtl(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
@@ -291,14 +294,12 @@ function nextSlot(now, tz, slots, jitter) {
 }
 
 function cfg(env) {
-  // 向后兼容：三个轮转变量一个都没设 = 老版本行为（只续租 + 409 自动恢复，绝不主动重启）。
-  // 想开检修轮转，随便设一个（INSTABOX_CYCLE / CYCLE_AT / PEAK_HOURS）就行。
-  const cycleVars = ["INSTABOX_CYCLE", "INSTABOX_CYCLE_AT", "INSTABOX_PEAK_HOURS"].some(
-    (k) => String(env[k] ?? "").trim() !== "",
-  );
+  // 检修轮转默认开，只有 INSTABOX_CYCLE=0/off/false/no 才关。
+  // 时间点优先级：手写 CYCLE_AT > 高峰自动排 > DEFAULT_CYCLE_AT。
   const peaks = parsePeaks(env.INSTABOX_PEAK_HOURS);
   const manualAt = parseCycleAt(env.INSTABOX_CYCLE_AT);
-  const autoAt = manualAt.length ? [] : autoSlots(peaks);
+  const autoAt = !manualAt.length && peaks.length ? autoSlots(peaks) : [];
+  const slots = manualAt.length ? manualAt : peaks.length ? autoAt : parseCycleAt(DEFAULT_CYCLE_AT);
   let cycleWarning =
     !manualAt.length && peaks.length && !autoAt.length
       ? "高峰时段太满：排不出间隔 < 8 小时的时间表，已退回「快到上限才转」"
@@ -311,11 +312,12 @@ function cfg(env) {
     // 被平台挂起后光续租没用，默认自愈：409 machine_not_running → resume/start → 再续租
     autoResume: parseAutoResume(env.INSTABOX_AUTO_RESUME ?? "1", true),
     // 快撞 max run time 时主动睡一觉再醒（默认开），提前量默认 20 分钟
-    cycle: parseAutoResume(env.INSTABOX_CYCLE, cycleVars),
+    cycle: parseAutoResume(env.INSTABOX_CYCLE, true),
     cycleMarginMin: clampMargin(env.INSTABOX_CYCLE_MARGIN_MIN, 20),
-    // 定时轮转：手写时间点优先；没写但配了高峰时段，就按高峰自动排（全落在空档里）
-    cycleAt: manualAt.length ? manualAt : autoAt,
+    // 定时轮转：手写时间点优先；没写但配了高峰时段，就按高峰自动排；都没有就用默认表
+    cycleAt: slots,
     cycleAtManual: manualAt.length > 0,
+    cycleAtDefault: !manualAt.length && !peaks.length,
     cycleWarning,
     cycleTz: safeTz(env.INSTABOX_CYCLE_TZ),
     cycleWindowMin: clampWindow(env.INSTABOX_CYCLE_WINDOW_MIN, 30),
@@ -396,10 +398,11 @@ function accountsOf(env, base) {
       lease: setting(env, "LEASE", n) || base.lease,
       ttl: clampTtl(setting(env, "LEASE_TTL", n), base.ttl),
       autoResume: parseAutoResume(setting(env, "AUTO_RESUME", n), base.autoResume),
-      cycle: parseAutoResume(setting(env, "CYCLE", n), at || pk ? true : base.cycle),
+      cycle: parseAutoResume(setting(env, "CYCLE", n), base.cycle),
       cycleMarginMin: clampMargin(setting(env, "CYCLE_MARGIN_MIN", n), base.cycleMarginMin),
       cycleAt: at ? parseCycleAt(at) : pk ? autoSlots(peaks) : base.cycleAt,
       cycleAtManual: at ? true : pk ? false : base.cycleAtManual,
+      cycleAtDefault: at ? false : pk ? false : base.cycleAtDefault,
       cycleWarning: pk && !at && !autoSlots(peaks).length ? "高峰时段太满：排不出间隔 < 8 小时的时间表" : base.cycleWarning,
       cycleTz: safeTz(setting(env, "CYCLE_TZ", n) || base.cycleTz),
       cycleWindowMin: clampWindow(setting(env, "CYCLE_WINDOW_MIN", n), base.cycleWindowMin),
@@ -906,7 +909,7 @@ function accountsView(c) {
       cycle: a.cycle,
       cycleMarginMin: a.cycleMarginMin,
       cycleAt: cycleAtText(a.cycleAt) || null,
-      cycleAtSource: a.cycleAtManual ? "manual" : a.peakText ? "auto" : null,
+      cycleAtSource: a.cycleAtManual ? "manual" : a.peakText ? "auto" : a.cycleAtDefault ? "default" : null,
       cycleWarning: a.cycleWarning || null,
       peakHours: a.peakText || null,
       cycleTz: a.cycleAt.length ? a.cycleTz : null,
