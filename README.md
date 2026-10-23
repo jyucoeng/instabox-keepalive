@@ -1,170 +1,158 @@
 # instabox-keepalive
 
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库用官方的 **activity lease** 定期续租，让它一直醒着；实现是一个 **Cloudflare Worker**：cron 每 5 分钟续一次租，不需要你自己的机器常开，一个 Worker 还能同时带多个账号。
+InstaBox 的免费机器有两条限制：
 
-代码只有两个文件：`worker/worker.js`（全部逻辑）和 `worker/wrangler.toml`（CLI 部署配置）。
+1. **空闲 30 分钟自动休眠** —— 靠官方 `activity lease` 续租就能一直压住
+2. **连续跑满 8 小时强制挂起，再冷却 10 分钟** —— 续租压不住，只能到点前自己重启一次
 
-> **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。详见文末《为什么关不掉休眠》。所以只能用租约这条官方口子。
+这个仓库是一个 **Cloudflare Worker**：cron 每 5 分钟续一次租（解决问题 1），需要时可以按固定时间点主动 `suspend → resume` 把连续运行计时清零（解决问题 2）。
 
-> 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**，靠那次请求真的出网 —— 这也是把续租放到 Cloudflare Worker 上的原因。
+不需要你自己的机器常开，一个 Worker 能同时带多个账号，免费额度用不到 3%。
 
-## cloudflare的worker部署（网页面板，推荐，不用装 wrangler）
+| 问题 | Worker 怎么处理 | 要配置吗 |
+| --- | --- | --- |
+| 空闲 30 分钟被休眠 | 每 5 分钟续一次租（TTL 900 秒） | 不用，部署完就生效 |
+| 机器被挂起/停掉 | 续租收到 `409 machine_not_running` 时自动 `resume` | 不用，默认开 |
+| 跑满 8 小时被强制挂起 + 冷却 | 到点前自己 `suspend → resume`，计时清零 | **要**，默认关 |
 
-1. Cloudflare 面板 → `Workers & Pages` → `Create` → `Worker` → 起个名字（例如 `instabox-keepalive`）→ `Deploy`
-2. `Edit code`，把 `worker/worker.js` 的内容整段粘进去（覆盖默认代码）→ `Deploy`
-3. `Settings` → `Variables and Secrets`，加这几条：
+代码只有两个文件：`worker/worker.js`（全部逻辑）、`worker/wrangler.toml`（CLI 部署用）。
+
+---
+
+## 一、部署（网页面板，5 分钟）
+
+不用装 wrangler。
+
+1. **建 Worker**：面板 → `Workers & Pages` → `Create` → `Worker` → 起名（如 `instabox-keepalive`）→ `Deploy`
+2. **贴代码**：`Edit code` → 把 `worker/worker.js` 全文覆盖进去 → `Deploy`
+3. **加变量**：`Settings` → `Variables and Secrets`，只加这两条就能跑：
 
    | 变量 | 类型 | 值 |
    | --- | --- | --- |
-   | `INSTABOX_API_KEY` | **Secret（加密）** | 你的 `ibk_...`（多账号见下面《多个账号》） |
-   | `TOKEN` | Secret（自己起一串随机值） | 之后所有请求都要带 `?token=` |
-   | `INSTABOX_MACHINE` | Text | 留空 = 保活该 key 名下全部机器；填 `qqq` 只保一台（多台用逗号分隔） |
-   | `INSTABOX_LEASE` | Text | `keepalive`（可选） |
-   | `INSTABOX_LEASE_TTL` | Text | `900`（默认）。要比 cron 间隔大：`*/5` 下填 `300` 正好卡在边界，没余量 |
-   | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
-   | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先 `resume`（stopped 用 `start` 兜底）再续租；设 `0` 只报错不唤醒 |
-   | `INSTABOX_CYCLE` | Text | 留空（默认）= **关，行为和老版本一致**：只续租 + 409 自动恢复，绝不主动重启。设 `1` 才开启轮转；设 `0` 也等于关 |
-   | `INSTABOX_CYCLE_MARGIN_MIN` | Text | `20`（默认）。提前多少分钟开始轮转；机器多要调大（每轮只轮转一台，至少 ≥ cron 间隔 × 机器数）；设 `0` 关掉兜底轮转 |
-   | `INSTABOX_CYCLE_AT` | Text | 留空（默认）= 不定时。填 `02:00,08:00,14:00,20:00` 就只在到点后轮转，方便知道重启落在哪个时间段 |
-   | `INSTABOX_CYCLE_TZ` | Text | `Asia/Shanghai`（默认）。`INSTABOX_CYCLE_AT` 用的时区 |
-   | `INSTABOX_CYCLE_WINDOW_MIN` | Text | `30`（默认）。到点后多少分钟内允许触发（cron 5 分钟一轮 = 6 次机会） |
-   | `INSTABOX_PEAK_HOURS` | Text | 留空（默认）。填 `10-12,14-18,20-23` 就自动排重启点（全在高峰之外、间隔 ≤7h）；`INSTABOX_CYCLE_AT` 优先于它 |
-   | `INSTABOX_CYCLE_JITTER_MIN` | Text | `0-0`（默认）。时间点抖动：到点后随机延迟这么多分钟才执行，比如 `0-15` |
-   | `INSTABOX_CYCLE_HOLD_SEC` | Text | `0-0`（默认）。主动轮转时 suspend 后停几秒再 resume，比如 `30-90` |
-   | `INSTABOX_WAKE_JITTER_MIN` | Text | `0-0`（默认）。平台冷却结束后再随机等几分钟才唤醒，比如 `0-5` → 总停机 10-15 分钟 |
-   | `INSTABOX_API_URL` | Text | `https://api.instabox.sh`（换私有网关时才用加这个变量） |
+   | `INSTABOX_API_KEY` | **Secret（加密）** | 你的 `ibk_...`（多账号见第四节） |
+   | `TOKEN` | **Secret** | 自己起一串随机值，例如 `openssl rand -hex 16` 的输出 |
 
-   > `TOKEN` 强烈建议一定要设：不设的话，任何知道你 Worker 域名的人都能触发续租/释放。
-   > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 5 分钟填 `900` 就有 3 倍余量，填 `300` 会在两次续租之间出现空窗。
-4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/5 * * * *`（每 5 分钟）→ 保存。这就是自动保活的开关
-5. 想看 `/log`：`Storage & Databases` → `KV` → `Create namespace`，然后在 Worker 的 `Settings` → `Bindings` 里加一个 KV 绑定，**变量名填 `LOG`**、选刚建的空间。不绑也能用，只是 `/log` 是空的
+4. **加定时**：`Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/5 * * * *` → 保存
 
-**机器筛选**
+   > 这就是保活开关。`*/5` 表示每小时 `:00/:05/:10…` 各跑一次，是**按钟表对齐**的，不是"上次跑完 +5 分钟"。
 
-- 不填 `INSTABOX_MACHINE`（推荐）：Worker 用你的 key 调 `GET /v1/machines` 自己列出名下所有机器，全部保活 —— 一个账号默认 支持多台，新加机器下一轮自动跟上
-- 填 `qqq` 只保这一台；也可以填机器 id（`m_...`）；多台用逗号分隔，例如 `qqq,box2`
-- 机器名由你创建机器时指定（`instabox ls` 或网页面板都能看到）
-- 租约是**每台机器各一份**，名字相同也不会互相干扰
+5. **（可选）绑 KV 看日志**：`Storage & Databases` → `KV` → `Create namespace`，再回到 Worker 的 `Settings` → `Bindings` 加一个 KV 绑定，**变量名必须填 `LOG`**。不绑也能用，只是 `/log` 是空的、长停机抖动降级为 600 秒。
 
-## 多个账号
+## 二、验证
 
-**一个账号就是一套单账号变量，第 N 个账号的变量名加 `_N` 后缀**。
+```sh
+curl "https://<你的worker>.workers.dev/status?token=<你的TOKEN>"
+```
 
-| 1 号账号（和单账号完全一样） | 2 号账号 | 说明 |
+看到 `"state": "running"`、`"remainingMinutes": 480` 就对了。`remainingMinutes` 是离 8 小时上限还剩几分钟，每轮 cron 会掉 5 左右。
+
+`TOKEN` 不填也能跑，但任何知道你 Worker 域名的人都能触发续租/释放，**强烈建议填**。
+
+## 三、配置项
+
+只有第一组是必填的，其余留空就是默认行为。**所有变量都支持 `_N` 后缀**做多账号（见第四节）。
+
+### 必填
+
+| 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `INSTABOX_API_KEY` | `INSTABOX_API_KEY_2` | **Secret**，必填 |
+| `INSTABOX_API_KEY` | — | `ibk_...`，存 Secret |
+| `TOKEN` | — | 访问口令，存 Secret，所有请求带 `?token=` |
+
+### 保活相关（一般不用改）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `INSTABOX_MACHINE` | 空 | 空 = 该 key 名下**全部机器**；填 `qqq` 只保一台，多台用逗号分隔，也可填机器 id |
+| `INSTABOX_LEASE` | `keepalive` | 租约名，同一台机器换名字等于换租约 |
+| `INSTABOX_LEASE_TTL` | `900` | 租约有效期（秒）。必须大于 cron 间隔：`*/5` 配 `300` 正好卡边界，`900` 有 3 倍余量 |
+| `INSTABOX_AUTO_RESUME` | `1` | 收到 409 时自动 `resume`（stopped 用 `start` 兜底）再续租；设 `0` 只报错不唤醒 |
+| `INSTABOX_LOG_MODE` | `hourly` | 写 KV 日志的频次：`hourly`（每小时最多 1 条）/ `every`（每次）/ `off` |
+| `INSTABOX_API_URL` | `https://api.instabox.sh` | 只有换私有网关时才需要改 |
+
+### 定时检修相关（可选，默认全关）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `INSTABOX_CYCLE` | 空 | 空或 `0` = **关**（只续租，绝不主动重启）；`1` = 开 |
+| `INSTABOX_CYCLE_AT` | 空 | 固定时间点，如 `01:30,08:00,13:00,19:00`。**填了就等于开启检修**，不用再写 `INSTABOX_CYCLE` |
+| `INSTABOX_PEAK_HOURS` | 空 | 只给高峰时段（如 `10-12,14-18,20-23`），自动排重启点。`CYCLE_AT` 优先于它 |
+| `INSTABOX_CYCLE_TZ` | `Asia/Shanghai` | 时间点按哪个时区算 |
+| `INSTABOX_CYCLE_WINDOW_MIN` | `30` | 到点后多少分钟内允许触发（`*/5` → 6 次机会） |
+| `INSTABOX_CYCLE_MARGIN_MIN` | `20` | 兜底：剩余多少分钟时强制轮转一次。设 `0` 关掉兜底 |
+| `INSTABOX_CYCLE_JITTER_MIN` | `0-0` | 开始时间抖动，如 `0-15` 表示到点后随机晚 0–15 分钟 |
+| `INSTABOX_CYCLE_HOLD_SEC` | `0-0` | 停机时长，如 `600-900` 表示停 10–15 分钟再唤醒 |
+| `INSTABOX_WAKE_JITTER_MIN` | `0-0` | 平台冷却结束后再随机等几分钟唤醒 |
+
+## 四、多账号
+
+**第 N 个账号 = 单账号变量名加 `_N` 后缀**，加一个账号就是多存一个 Secret：
+
+| 1 号账号 | 2 号账号 | 说明 |
+| --- | --- | --- |
+| `INSTABOX_API_KEY` | `INSTABOX_API_KEY_2` | 必填，Secret |
 | `INSTABOX_MACHINE` | `INSTABOX_MACHINE_2` | 可选，留空 = 该账号全部机器 |
-| `INSTABOX_LEASE` | `INSTABOX_LEASE_2` | 可选，默认 `keepalive` |
-| `INSTABOX_LEASE_TTL` | `INSTABOX_LEASE_TTL_2` | 可选，默认 `900` |
-| `INSTABOX_AUTO_RESUME` | `INSTABOX_AUTO_RESUME_2` | 可选，默认 `1` |
-| `INSTABOX_CYCLE` | `INSTABOX_CYCLE_2` | 可选，留空 = 关（老版本行为）；`1` = 开 |
-| `INSTABOX_CYCLE_MARGIN_MIN` | `INSTABOX_CYCLE_MARGIN_MIN_2` | 可选，默认 `20`（提前多少分钟轮转） |
-| `INSTABOX_CYCLE_AT` | `INSTABOX_CYCLE_AT_2` | 可选，留空 = 不定时；填了就按时间点轮转 |
-| `INSTABOX_CYCLE_TZ` | `INSTABOX_CYCLE_TZ_2` | 可选，默认 `Asia/Shanghai` |
-| `INSTABOX_CYCLE_WINDOW_MIN` | `INSTABOX_CYCLE_WINDOW_MIN_2` | 可选，默认 `30` |
-| `INSTABOX_PEAK_HOURS` | `INSTABOX_PEAK_HOURS_2` | 可选，填了就自动排重启点 |
-| `INSTABOX_CYCLE_JITTER_MIN` | `INSTABOX_CYCLE_JITTER_MIN_2` | 可选，默认 `0-0` |
-| `INSTABOX_CYCLE_HOLD_SEC` | `INSTABOX_CYCLE_HOLD_SEC_2` | 可选，默认 `0-0` |
-| `INSTABOX_WAKE_JITTER_MIN` | `INSTABOX_WAKE_JITTER_MIN_2` | 可选，默认 `0-0` |
+| `INSTABOX_LEASE` | `INSTABOX_LEASE_2` | 可选 |
+| `INSTABOX_LEASE_TTL` | `INSTABOX_LEASE_TTL_2` | 可选 |
+| `INSTABOX_AUTO_RESUME` | `INSTABOX_AUTO_RESUME_2` | 可选 |
+| `INSTABOX_CYCLE` 及后续所有 `INSTABOX_CYCLE_*` / `INSTABOX_PEAK_HOURS` / `INSTABOX_WAKE_JITTER_MIN` | 同左加 `_2` | 可选 |
 
-- 加一个账号 = 在面板上再加一个 `INSTABOX_API_KEY_2` Secret，就这一步
-- 带后缀的优先，没写的自动继承不带后缀的全局值；`INSTABOX_MACHINE` 也会继承，所以两个账号机器名不一样时记得写 `INSTABOX_MACHINE_2`
-- 编号可以不连续（只配 `_2` 也能跑）；`INSTABOX_API_KEY_1` 等同于 `INSTABOX_API_KEY`
-- 同一把 key 配了两次只续一次
-- 每个账号的机器列表分开缓存、分开续租：某个账号 key 失效或机器被挂起，不影响其它账号
-- `/accounts` 看现在认到了几个账号（key 打码）；`?account=2` 只操作 2 号（`/`、`/status`、`/release` 都支持）
-- KV 绑定不用动：还是 `LOG`、还是每小时最多 1 条，多账号只是让每条日志里多几个 `account` 编号
-- 免费版 Worker 每次调用最多 50 个子请求：一个账号大约「1 次列机器 + 每台 1 次续租」，账号/机器多的时候别超（付费版 1000 次）
+规则：
 
-**配置示例：三把 key，其它全用全局值**
+- 带后缀的优先；没写的自动继承不带后缀的全局值
+- `INSTABOX_MACHINE` 也会继承 —— 两个账号机器名不同时，记得单独写 `INSTABOX_MACHINE_2`
+- 编号可以不连续（只配 `_2` 也能跑），`INSTABOX_API_KEY_1` 等同 `INSTABOX_API_KEY`
+- 同一把 key 配两次只续一次；某个账号 key 失效不影响其它账号
+- 每个账号的机器列表分开缓存、分开续租
 
-面板 `Variables and Secrets` 里最终就这几条（key 和 token 都是 Secret）：
+**三把 key、其余全用默认值**，面板上最终就这几条：
 
 | 变量 | 类型 | 值 |
 | --- | --- | --- |
-| `INSTABOX_API_KEY` | Secret | `ibk_aaa…`（1 号账号） |
-| `INSTABOX_API_KEY_2` | Secret | `ibk_bbb…`（2 号账号） |
-| `INSTABOX_API_KEY_3` | Secret | `ibk_ccc…`（3 号账号） |
-| `TOKEN` | Secret | 自己起一串随机值，例如 `openssl rand -hex 16` 的输出 |
-| `INSTABOX_LEASE_TTL` | Text | `900` |
-| `INSTABOX_LOG_MODE` | Text | `hourly` |
+| `INSTABOX_API_KEY` | Secret | `ibk_aaa…` |
+| `INSTABOX_API_KEY_2` | Secret | `ibk_bbb…` |
+| `INSTABOX_API_KEY_3` | Secret | `ibk_ccc…` |
+| `TOKEN` | Secret | 自己起的随机串 |
+| `INSTABOX_LEASE_TTL` | Text | `900`（不写也是 900） |
+| `INSTABOX_LOG_MODE` | Text | `hourly`（不写也是 hourly） |
 
-`INSTABOX_MACHINE` / `INSTABOX_LEASE` / `INSTABOX_AUTO_RESUME` 都不写，效果就是：每个账号保活自己名下**全部机器**、租约名 `keepalive`、碰到挂起/停掉自动唤醒。cron 填 `*/5 * * * *`。
+部署完打开 `/accounts?token=...`，看到 `#1` `#2` `#3` 三行（key 打码）就说明都认到了。
 
-反过来，如果几个账号都只想保活同名的那台机器（比如都叫 `qqq`），只写一个 `INSTABOX_MACHINE=qqq` 就行，所有账号都会继承这个筛选。
+## 五、8 小时上限与定时检修（可选）
 
-CLI 部署等价操作（`worker/wrangler.toml` 里已经带了 cron 和 `INSTABOX_LEASE_TTL=900`）：
+免费机 `maxRunMinutes = 480`（8 小时，账号级固定）。跑满后平台强制挂起，并进入冷却（`cooldownUntil`，默认 10 分钟）——**冷却期内 `resume` / `start` / `wake` 全部返回 `409 machine_cooldown`**，只能等。
 
-```sh
-cd worker
-npx wrangler secret put INSTABOX_API_KEY
-npx wrangler secret put INSTABOX_API_KEY_2
-npx wrangler secret put INSTABOX_API_KEY_3
-npx wrangler secret put TOKEN
-npx wrangler deploy
-```
+### 三种策略
 
-部署完打开 `/accounts?token=...`，看到 `#1`、`#2`、`#3` 三行（key 打码）就说明三把 key 都认到了；再打开 `/status?token=...` 看每个账号下的机器。
-
-## 机器被挂起/停掉会怎样
-
-续租对 `suspended` / `stopped` 的机器一律回 `409 machine_not_running`——光续租是空转，机器不会自己醒。默认 `INSTABOX_AUTO_RESUME=1`：碰到这个错就先 `POST /resume`（`stopped` 的用 `/start` 兜底），等它变成 `running` 再立刻续租；日志里这条会带 `"resumed":true` 和 `"wake":["resume:202"]`。设成 `0` 就只报错、不唤醒。
-
-## 8 小时上限与 10 分钟冷却（max run time）
-
-> **向后兼容**：这一节的功能全是可选的。`INSTABOX_CYCLE` / `INSTABOX_CYCLE_AT` / `INSTABOX_PEAK_HOURS` 一个都不设时，Worker 的行为和老版本**完全一样**——只续租、遇到 `409 machine_not_running` 自动唤醒，不会做任何主动停机/轮转。升级 Worker 代码本身不会改变现有部署的行为，想开检修轮转再逐个加变量。
-
-免费机除了「空闲 30 分钟挂起」，还有一条**连续运行上限**：`maxRunMinutes = 480`（8 小时，免费版固定，只有 admin 能改）。跑满 8 小时平台会强制挂起，并进入一段冷却（`cooldownUntil`，默认 10 分钟）——**冷却期内所有唤醒路径都回 `409 machine_cooldown`**，`resume` / `start` / `wake` 全都不行，只能等。
-
-续租只能压住「空闲挂起」，压不住这条上限。**默认不干预**（和老版本一致）；想避开这 10 分钟冷却，再加变量开启主动轮转：
-
-| 策略 | 行为 | 代价 |
+| 策略 | 怎么配 | 结果 |
 | --- | --- | --- |
-| **不干预**（默认，什么变量都不加） | 只续租；真被平台挂了，下一轮 cron 看到 `cooldownUntil` 还没到就跳过，到了再 `resume` | 每 8 小时停 10 分钟 + 最多一个 cron 间隔 |
-| **主动轮转**（`INSTABOX_CYCLE=1`，需手动开启） | `GET /v1/machines` 里读 `runStartedAt` / `maxRunMinutes`，剩 `INSTABOX_CYCLE_MARGIN_MIN` 分钟（默认 20）时自己 `suspend` → 等 `suspended` → `resume`，连续运行计时清零，再续租 | 每 8 小时有一次短暂暂停（几秒到半分钟；进程通常保留，`runtime.processesPreserved`） |
-| **显式关闭**（`INSTABOX_CYCLE=0`） | 同「不干预」，即使配了 `CYCLE_AT` 也不轮转 | 同上 |
+| **不干预**（默认） | 什么都不加 | 每 8 小时停 10 分钟 + 最多一个 cron 间隔 |
+| **定时检修**（推荐） | `INSTABOX_CYCLE_AT=...` | 在你指定的时间点停 10–30 秒，永远不进冷却 |
+| **显式关闭** | `INSTABOX_CYCLE=0` | 同"不干预"，即使写了 `CYCLE_AT` 也不转 |
 
-细节：
-
-- 冷却中的机器**不会**被反复打接口：结果里是 `"coolingDown":true` 和 `cooldownUntil`，日志和 `/status` 都看得到
-- 主动轮转**每轮 cron 只做一台**（一次轮转约 20 个子请求，免费版每次调用上限 50 个）。机器多就把 `INSTABOX_CYCLE_MARGIN_MIN` 调大，至少 `cron 间隔 × 机器数`（3 台 + `*/5` → 建议 `20`）
-- 轮转是**生命周期操作，会让旧租约失效**，所以醒来后会立刻重新续租一次
-- 付费机的 `maxRunMinutes` 默认是 `-1`（不限），这条逻辑不会触发
-- 手动 `GET /?token=...` 也会走同一套判断，想立刻轮转不用等 cron
-- 如果你的机器上有必须连续跑满 8 小时以上的任务，把 `INSTABOX_CYCLE` 设成 `0`，或者升级付费版
-
-### 固定在某个时间段轮转
-
-开启轮转后，默认是「快到 8 小时才转」，时间点会随机器启动时间漂移。想固定在某个时间段，用 `INSTABOX_CYCLE_AT`（只要加了这一行就等于开启轮转，不用再写 `INSTABOX_CYCLE`）：
+### 开法 A：固定时间点
 
 ```toml
-INSTABOX_CYCLE_AT = "01:30,08:00,13:00,19:00"   # 本地时间，逗号分隔（这套是避开高峰的排法）
-INSTABOX_CYCLE_TZ = "Asia/Shanghai"              # 上面这些时间按哪个时区算
-INSTABOX_CYCLE_WINDOW_MIN = "30"                 # 到点后 30 分钟内触发
+INSTABOX_CYCLE_AT = "01:30,08:00,13:00,19:00"   # 本地时间，逗号分隔
+INSTABOX_CYCLE_TZ = "Asia/Shanghai"
+INSTABOX_CYCLE_WINDOW_MIN = "30"                # 到点后 30 分钟内触发
 ```
 
-到点后、窗口内、并且这台机器「这个点之后还没重启过」才轮转，所以**一个时间点只会转一次**，不会在窗口里反复重启（判断靠 `runStartedAt` 和点比较，不需要 KV）。
+**两个时间点之间必须小于 8 小时**，否则中间还是会撞上上限：
 
-**时间点间隔必须小于 8 小时**，否则两次轮转之间还是会撞上 max run time：
-
-| 时间点 | 每轮最多跑 | 余量 | 说明 |
+| 时间点 | 最大间隔 | 余量 | 说明 |
 | --- | --- | --- | --- |
-| `01:30,08:00,13:00,19:00` | 6.5 小时 | 1.5 小时 | **推荐（避开高峰 10-12 / 14-18 / 20-23）**：凌晨、上班前、午休、傍晚，四个点全在低谷 |
-| `02:00,08:00,14:00,20:00` | 6 小时 | 2 小时 | 一天 4 次，间隔最均匀；14:00 / 20:00 落在白天和晚间 |
+| `01:30,08:00,13:00,19:00` | 6.5 小时 | 1.5 小时 | **推荐**，避开高峰 10-12 / 14-18 / 20-23 |
+| `02:00,08:00,14:00,20:00` | 6 小时 | 2 小时 | 间隔最均匀 |
 | `00:00,06:00,12:00,18:00` | 6 小时 | 2 小时 | 整点党 |
-| `03:00,10:00,17:00,00:00` | 7 小时 | 1 小时 | 一天 3-4 次，间隔不均匀但都 < 8h |
-| `04:00`（一天一次） | 24 小时 | ❌ | **不行**，8 小时就被平台挂了 |
+| `03:00,10:00,17:00,00:00` | 7 小时 | 1 小时 | 三次一天，间隔不均 |
+| `04:00`（一天一次） | 24 小时 | ❌ | 不行，8 小时就被挂了 |
 
-几个细节：
+同一个时间点只会转一次：判断靠 `runStartedAt` 和点比较，不需要额外存储。
 
-- 重启的**准点程度只取决于 cron 粒度**：`*/5` 能精确命中整点/半点（本仓库默认，配合上面四个时间点就是准点），`*/9` 会晚最多 9 分钟，`*/1` 任意分钟都准（1440 次/天，免费额度 10 万次/天，完全够）
-- `INSTABOX_CYCLE_MARGIN_MIN=0` 可以关掉「快到上限」的兜底轮转，严格只按时间点走；但某个点要是被跳过（比如 Worker 出错），就会吃 10 分钟冷却
-- `/status` 里每台机器多了 `nextCycleAt`（下一次轮转时间）和 `cycleAt` / `cycleTz`，不用自己算
-- 时间点写错（比如 `25:00`）会被忽略，不会导致 Worker 报错
+### 开法 B：只给高峰时段，自动排
 
-### 懒人版：只配高峰时段，自动排时间点
-
-不想自己算，就把高峰时段告诉 Worker，它会自己挑重启点（全部落在高峰之外、间隔尽量均匀、最大 7 小时）：
+不想自己算时间点，就把高峰告诉它：
 
 ```toml
 INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"
@@ -172,82 +160,19 @@ INSTABOX_CYCLE_TZ = "Asia/Shanghai"
 # INSTABOX_CYCLE_AT 留空
 ```
 
-支持 `10-12`（整点）和 `10:30-12:00`（带分钟）、跨零点 `23-02`，多个时段用逗号分隔。
+会自动排成 `00:00, 06:00, 12:00, 18:00`（全在高峰外、间隔 6 小时）。支持 `10-12`、`10:30-12:00`、跨零点 `23-02`。
 
-上面这组会排成：
-
-```text
-00:00, 06:00, 12:00, 18:00     # 间隔 6 小时，四次全在高峰之外
-```
-
-`/accounts` 里能看到排出来的结果和来源：
+`/accounts` 能看到排出来的结果和来源：
 
 ```json
-{
-  "cycleAt": "00:00,06:00,12:00,18:00",
-  "cycleAtSource": "auto",
-  "peakHours": "10-12,14-18,20-23",
-  "nextCycleAt": "2026-10-23T10:00:00.000Z"
-}
+{ "cycleAt": "00:00,06:00,12:00,18:00", "cycleAtSource": "auto", "nextCycleAt": "2026-10-23T10:00:00.000Z" }
 ```
 
-如果高峰排得太满（比如 `09-18,20-23`），自动排不出「间隔 < 8 小时且全在空档」的时间表，会退回「快到上限才转」，并在 `/accounts` 里给出 `cycleWarning` 说明原因。
+高峰排得太满（如 `09-18,20-23`）会排不出合法时间表，退回"快到上限才转"，并在 `/accounts` 的 `cycleWarning` 里说明原因。两个都配时 `CYCLE_AT` 优先。
 
-两个都配的时候 `INSTABOX_CYCLE_AT` 优先（手写优先于自动）。自动排班只保证「避开高峰 + 间隔够短」，具体点不一定等于你手写的那几个；想保留 8 点这种固定点，就手写 `INSTABOX_CYCLE_AT`。
+### 一次检修发生了什么
 
-### 随机抖动（默认全关 = 固定时间检修）
-
-三个抖动参数默认都是 `0-0`，也就是**固定时间检修**：cron `*/5` 能精确命中整点/半点，`01:30 / 08:00 / 13:00 / 19:00` 到点就停、秒级恢复。只有想让时间看起来不那么规律时，才按需打开：
-
-三个参数作用点不同，别混：
-
-| 变量 | 作用点 | 例子 |
-| --- | --- | --- |
-| `INSTABOX_CYCLE_JITTER_MIN` | **开始时间**：到点后延迟几分钟才执行 | `0-15` → 8:00 那次落在 8:00–8:15；**默认 `0-0` 就是准点** |
-| `INSTABOX_CYCLE_HOLD_SEC` | **停机时长**：suspend 后停多久再 resume | `600-900` → 每次停 10–15 分钟 |
-| `INSTABOX_WAKE_JITTER_MIN` | **平台冷却之后**再等多久唤醒 | `0-5` → 总停机 10–15 分钟 |
-
-要「准点停、时长 10–15 分钟随机」，这样配：
-
-```toml
-INSTABOX_CYCLE_JITTER_MIN = "0-0"     # 开始时间不抖 → 8:00 就是 8:00
-INSTABOX_CYCLE_HOLD_SEC = "600-900"   # 停 10-15 分钟随机
-```
-
-`INSTABOX_CYCLE_HOLD_SEC` 有两种执行方式：
-
-- **≤600 秒**：在本轮 cron 调用里 sleep 完再 resume（一次调用最长 15 分钟，留足余量）
-- **>600 秒**：写进 KV（`hold:<机器id>`），本轮只负责 suspend，后面某一轮看到时间到了才 resume。需要绑定 KV（`LOG`），没绑会封顶 600 秒；恢复时间会晚一个 cron 周期（`*/5` → 最多晚 5 分钟）
-
-平台那 10 分钟冷却是服务端行为，改不了；`INSTABOX_WAKE_JITTER_MIN` 只是「冷却结束后再等一会儿」，效果同样是 10–15 分钟。
-
-抖动值用时间戳做种子（`stableRand`）：同一个时间点当天算出来固定，cron 反复跑不会跳来跳去；第二天换了时间点，偏移也跟着变。
-
-两个取舍：
-
-- 想让 8:00 准点，就别开 `INSTABOX_CYCLE_JITTER_MIN`（默认就是关的）
-- 抖动只能让**时间**不规律，改不了「这是自动化」的事实；真要低调，少做几次 suspend/resume 比抖动更有效
-
-### 一次检修到底发生了什么
-
-以默认配置（`01:30 / 08:00 / 13:00 / 19:00`、抖动全关、3 台机器）为例，走一遍完整流程。
-
-**时间点**（`Asia/Shanghai` 本地时间，cron `*/5` 命中整点/半点，误差秒级）：
-
-| 时间点 | 场景 |
-| --- | --- |
-| 01:30 | 凌晨 |
-| 08:00 | 上班前 |
-| 13:00 | 午休 |
-| 19:00 | 傍晚 |
-
-四个点都落在高峰 10–12 / 14–18 / 20–23 之外。改时间点只要改 `INSTABOX_CYCLE_AT`，不用动代码。
-
-**停多久**：每台机器约 **10–30 秒**。`INSTABOX_CYCLE_HOLD_SEC=0` 表示确认睡下后立刻叫醒，中间不额外停留。一天 4 次 × 3 台，累计停机约 1–2 分钟；进程通常保留（`runtime.processesPreserved`），跑着的任务不会丢。
-
-**怎么唤醒**：三种情况都是 Worker 自己发 `resume`，不等平台来叫。
-
-1. **主动轮转**（常规路径）
+以 `01:30 / 08:00 / 13:00 / 19:00`、抖动全关为例：
 
 ```text
 19:00:0x  cron 触发，读 runStartedAt / remainingMinutes
@@ -255,74 +180,109 @@ INSTABOX_CYCLE_HOLD_SEC = "600-900"   # 停 10-15 分钟随机
 19:00:0x  POST /suspend
           ↓ 每 2 秒查一次 state，最多 8 次（≈16 秒）
 19:00:1x  确认 suspended
-          ↓ hold=0，立刻
 19:00:1x  POST /resume（失败自动用 /start 兜底）
           ↓ 每 5 秒查一次 state，最多 12 次（≈60 秒）
 19:00:2x  确认 running
-          ↓ 生命周期操作会让旧租约失效，必须补一次
-19:00:2x  PUT 活动租约（15 分钟有效）
+19:00:2x  PUT 活动租约（生命周期操作会让旧租约失效，必须补一次）
 ```
 
-2. **空闲挂起**（30 分钟没活动被平台挂起）：下一轮 cron 续租拿到 `409 machine_not_running` → 自动 `resume`（stopped 状态用 `start`）→ 再续租。老版本就是这个行为，没变。
+- **停多久**：每台约 10–30 秒（`CYCLE_HOLD_SEC=0` 就是确认睡下立刻叫醒）。进程通常保留（`runtime.processesPreserved`），跑着的任务不丢
+- **多台错峰**：一次 cron 只轮转一台（一次轮转约 20 个子请求，免费版单次上限 50），3 台就是 19:00 / 19:05 / 19:10，30 分钟窗口覆盖得住
+- **兜底**：某个点没赶上（Worker 故障、正在部署），剩余时间掉到 `CYCLE_MARGIN_MIN`（默认 20 分钟）时立刻补一次
+- 手动 `GET /?token=` 也走同一套判断，想立刻轮转不用等 cron；时间点写错（如 `25:00`）会被忽略，不会让 Worker 报错
 
-3. **跑满 8 小时被平台强制挂起**：读到 `cooldownUntil` 还没到就跳过，不白打接口；到点立刻 `resume`（`WAKE_JITTER_MIN=0`，冷却一过就醒）。只在上面两种都没兜住时才会发生。
+### 抖动（可选，默认全关）
 
-**多台机器错峰**：一次 cron 调用只轮转一台（免费版单次 50 个子请求，一次轮转约 20 个），所以 3 台是：
+默认是**固定时间检修**：到点就停、秒级恢复。想让时间不那么规律再加：
+
+| 变量 | 作用点 | 例子 |
+| --- | --- | --- |
+| `INSTABOX_CYCLE_JITTER_MIN` | **开始时间**延后 | `0-15` → 8:00 那次落在 8:00–8:15 |
+| `INSTABOX_CYCLE_HOLD_SEC` | **停机时长** | `600-900` → 每次停 10–15 分钟 |
+| `INSTABOX_WAKE_JITTER_MIN` | **冷却结束后**再等 | `0-5` → 总停机 10–15 分钟 |
+
+`INSTABOX_CYCLE_HOLD_SEC` 超过 600 秒时，会写进 KV（`hold:<机器id>`），本轮只负责 suspend，后面某一轮看到时间到了才 resume —— 所以需要绑定 KV，没绑会封顶 600 秒，且恢复会晚一个 cron 周期。
+
+抖动用时间戳做种子（`stableRand`），同一天同一个点算出来固定，cron 反复跑不会跳。
+
+## 六、机器被挂起/停掉会怎样
+
+续租对 `suspended` / `stopped` 的机器一律回 `409 machine_not_running`，光续租是空转。默认 `INSTABOX_AUTO_RESUME=1`：先 `POST /resume`（stopped 用 `/start` 兜底），等 `running` 再立刻续租，日志里带 `"resumed": true` 和 `"wake": ["resume:202"]`。
+
+跑满 8 小时进入冷却的情况不同：冷却期内唤醒路径全部 409，Worker 会跳过不打接口，结果里是 `"coolingDown": true` + `cooldownUntil`，到点再 `resume`。
+
+## 七、接口
 
 ```text
-19:00  机器 A
-19:05  机器 B
-19:10  机器 C
+GET /?token=xxx                    所有账号各续租一次（也是 cron 跑的逻辑）
+GET /status?token=xxx              所有账号的机器状态
+GET /accounts?token=xxx            配了哪些账号（key 打码）
+GET /log?token=xxx                 最近 48 条日志
+GET /release?token=xxx             放掉租约
 ```
 
-30 分钟窗口（`CYCLE_WINDOW_MIN`）覆盖得住；同一个点只触发一次，不会在窗口里反复重启（靠 `runStartedAt` 和点比较，不需要额外存储）。机器更多就按「5 分钟一台」往后顺延，窗口相应调大。
+- 任何路由都支持 `&account=2` 只操作 2 号账号，以及 `&format=text` 输出纯文本
+- 不带 `format=text` 返回 JSON；`?token=` 错了返回 `401`
 
-**兜底**：某个点没赶上（Worker 故障、正在部署），机器剩余时间掉到 `CYCLE_MARGIN_MIN`（默认 20 分钟）时会立刻补一次，不用等下一个点。
+`/status` 每台机器带这些字段，排障够用：
 
-## 接口
+| 字段 | 含义 |
+| --- | --- |
+| `state` | `running` / `suspended` / `stopped` |
+| `maxRunMinutes` | 连续运行上限（免费 480，付费 -1 = 不限） |
+| `runStartedAt` | 本轮连续运行起点 |
+| `remainingMinutes` | 离上限还剩几分钟 |
+| `cooldownUntil` | 冷却到什么时候（没冷却为 `null`） |
+| `nextCycleAt` | 下次定时轮转时间（没配检修时为 `null`） |
 
-```
-https://<你的worker>.workers.dev/?token=xxx                   所有账号各续租一次
-https://<你的worker>.workers.dev/status?token=xxx             所有账号的机器状态
-https://<你的worker>.workers.dev/accounts?token=xxx           配了哪些账号（key 打码）
-https://<你的worker>.workers.dev/log?token=xxx                最近 48 条保活日志
-https://<你的worker>.workers.dev/log?token=xxx&format=text    纯文本，方便 grep
-https://<你的worker>.workers.dev/release?token=xxx            放掉租约
-https://<你的worker>.workers.dev/status?token=xxx&account=2   只看 2 号账号（/、/release 同样支持）
-```
+`/` 的结果里，被轮转的机器带 `"cycled": true`、`"trigger": "slot"`（定时）或 `"limit"`（兜底）、`"wake": ["suspend:202","resume:202"]`。
 
-`?token=` 就是上面那个 `TOKEN` 变量；设了就必须带，不带返回 `401 token 不对`。不带 `format=text` 时返回 JSON，任何路由都能加 `&format=text` 看纯文本。cron 跑的结果和 `/` 一样，也写进 `/log`（绑了 KV 才有），每条记着时间、租约、几台、每台到期时间；多账号时每台机器还带 `account` 编号（`1`、`2`…）。
+## 八、常见问题
 
-`/status` 每台机器除了 `state`，还会带 `maxRunMinutes` / `runStartedAt` / `remainingMinutes`（离 8 小时上限还剩几分钟）/ `cooldownUntil`（冷却到什么时候）/ `nextCycleAt`（下次定时轮转时间，没配 `INSTABOX_CYCLE_AT` 时为 `null`），排障时看这几个就够了。`/` 的结果里，被主动轮转的机器带 `"cycled":true`、`"trigger":"slot"`（定时）或 `"limit"`（兜底）和 `"wake":["suspend:202","resume:202"]`，冷却中的带 `"coolingDown":true` 和 `"wakeAt"`（算上随机抖动后真正的唤醒时间）。
+**为什么不能直接把自动休眠关掉？**
 
-## KV 额度够不够
+2026-10-18 实测：普通/邀请制账号的 `/v1/me` 返回 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲阈值锁在**账号级**。对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（包括官方 CLI `instabox auto-suspend <box> 0` 和 SDK `setAutoSuspend`）一律返回 200，但值仍是 1800 —— 静默忽略。所以只能用租约这条官方口子。
 
-免费版 KV 每天 1000 次写、10 万次读。默认 `hourly` 模式下，同一小时的连续成功只写 1 条：每天约 24 次写（失败会立刻写，不受去重影响），占额度 2.4%，怎么跑都不会满。手动 `/?token=` 触发一定写日志，不参与去重。
+**为什么不在机器里跑定时任务？**
 
-多账号不会增加写次数：一条日志装的是所有账号的汇总，`hourly` 模式下仍然每小时最多 1 条，额度算法和单账号完全一样。KV 绑定名、namespace、`log` 这个 key 也都不用改。
+机器一 suspend，里面的 cron / systemd timer 全冻住，谁也叫不醒自己。续租必须来自**外部**，而且请求要真的出网 —— 这就是放在 Cloudflare Worker 上的原因。
+
+**cron 5 分钟一轮，19:00 这种整点能凑准吗？**
+
+能。`*/5 * * * *` 是按时钟对齐的（每小时 `:00/:05/:10…`），和"上次跑完 +5 分钟"无关，也和你什么时候部署无关。Cloudflare 投递会有几十秒延迟（日志里是 `:00:4x`），落在 30 分钟窗口内，不影响判断。
+
+**免费版额度够吗？**
+
+- **子请求**：每次调用上限 50 个（付费 1000）。一个账号约「1 次列机器 + 每台 1 次续租」；一次轮转约 20 个。3 个账号各 1 台，正常续租用不到 10 个
+- **KV 写**：免费版每天 1000 次。默认 `hourly` 模式下每天约 24 次（每小时最多 1 条），占 2.4%；多账号也是一条日志装全部账号，不会翻倍
+- 手动 `/?token=` 触发一定写日志，不参与去重
 
 | cron 间隔 | 次数/天 | `every` 模式写/天 | `hourly` 模式写/天 |
 | --- | --- | --- | --- |
-| `* * * * *`（1 分钟） | 1440 | **1440（超 1000 额度）** | ~24 |
+| `* * * * *`（1 分钟） | 1440 | **1440（超额度）** | ~24 |
 | `*/2`（2 分钟） | 720 | 720（72%） | ~24 |
-| `*/5`（**当前默认**） | 288 | 288（28.8%） | ~24 |
+| `*/5`（**默认**） | 288 | 288（28.8%） | ~24 |
 | `*/9`（旧默认） | 160 | 160（16%） | ~24 |
 
-当前用的是 `*/5` + `hourly`：**每天约 24 次写，占额度 2.4%**，比 `*/9` 时代完全没变——续租更勤只影响读请求和子请求，不影响 KV 写。
+**改了 cron 间隔要注意什么？**
 
-`hourly` 模式下无论 cron 多密都是每天 ~24 次写；只有切成 `every` 才会跟着间隔线性涨：`*/5` 是 288 次（28.8%，够用），1 分钟就是 1440 次直接超额度，那时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
+`INSTABOX_LEASE_TTL` 必须大于 cron 间隔，否则两次续租之间会空窗。`*/5` 配 `900` 有 3 倍余量；改回 `*/9` 也够（900 > 540）。间隔拉到 15 分钟以上就要把 TTL 一起调大。
 
-## CLI 部署（可选）
+**机器上有必须连续跑 8 小时以上的任务怎么办？**
+
+把 `INSTABOX_CYCLE` 设成 `0`（或删掉 `CYCLE_AT`），或者升级付费版（`maxRunMinutes = -1`，不限）。
+
+## 九、CLI 部署（可选）
 
 ```sh
 cd worker
-npx wrangler secret put INSTABOX_API_KEY       # 1 号账号（key 只进 secret，不写进 wrangler.toml）
+npx wrangler secret put INSTABOX_API_KEY       # key 只进 secret，不写进 wrangler.toml
 npx wrangler secret put INSTABOX_API_KEY_2     # 2 号账号，要几个加几个
+npx wrangler secret put TOKEN
 npx wrangler deploy
 ```
 
-`worker/wrangler.toml` 里已经设好 `crons = ["*/5 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。
-
+`worker/wrangler.toml` 里已经设好 `crons = ["*/5 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，检修相关变量默认注释掉（保持和旧版行为一致），需要时取消注释。
 
 ## 免责声明
 
