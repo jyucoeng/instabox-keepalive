@@ -8,10 +8,10 @@
 //   INSTABOX_API_KEY_2    2 号账号的 key
 //   INSTABOX_API_KEY_3    3 号账号的 key ……
 //
-// 检修轮转默认关：只有显式 INSTABOX_CYCLE=1（或 on/true/yes）才启用。
-// 不开时 INSTABOX_CYCLE_AT / INSTABOX_PEAK_HOURS / INSTABOX_CYCLE_MARGIN_MIN 一律不生效，
+// 检修轮转默认开：只有显式 INSTABOX_CYCLE=0（或 off/false/no）才关掉。
+// 关掉时 INSTABOX_CYCLE_AT / INSTABOX_PEAK_HOURS / INSTABOX_CYCLE_MARGIN_MIN 一律不生效，
 // Worker 只做「续租 + 409 自动唤醒」。
-// 开了以后：INSTABOX_CYCLE_AT 不写就用 DEFAULT_CYCLE_AT（01:30/08:00/13:00/19:00），
+// 默认开的情况下：INSTABOX_CYCLE_AT 不写就用 DEFAULT_CYCLE_AT（01:30/08:00/13:00/19:00），
 // 写了 INSTABOX_PEAK_HOURS 就按高峰自动排，两者都写则 CYCLE_AT 优先。
 //
 // 每个账号还可以单独覆盖 INSTABOX_MACHINE_2 / INSTABOX_LEASE_2 /
@@ -38,8 +38,9 @@
 //
 // max run time：免费机固定 480 分钟（8 小时），跑满会被平台强制挂起并进入 10 分钟冷却
 // （Machine.cooldownUntil，冷却期内所有唤醒路径都回 409 machine_cooldown）。
-// 默认不轮转：INSTABOX_CYCLE 不写（或写 0/off/false/no）时，只等平台冷却结束再唤醒
-// （每 8 小时停 10 分钟以上）。显式 INSTABOX_CYCLE=1 才启用下面的主动轮转。
+// 默认轮转：连续运行剩 INSTABOX_CYCLE_MARGIN_MIN 分钟（默认 20）时，
+// 自己先 suspend 再 resume，把「连续运行」计时清零，代价是短暂暂停而不是 10 分钟停机。
+// 设成 0 就只等冷却结束再唤醒（每 8 小时停 10 分钟以上）。
 //
 // 想固定重启时间段：INSTABOX_CYCLE_AT="02:00,08:00,14:00,20:00"（本地时间，逗号分隔），
 // INSTABOX_CYCLE_TZ="Asia/Shanghai" 指定时区，到点后 INSTABOX_CYCLE_WINDOW_MIN（默认 30）
@@ -57,7 +58,7 @@
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 900; // 要比 cron 间隔大；*/5 下 300 正好卡在边界，900 有 3 倍余量
-// 检修轮转的默认时间表：开了 INSTABOX_CYCLE 又没写 INSTABOX_CYCLE_AT 时用这套
+// 检修轮转的默认时间表：没写 INSTABOX_CYCLE_AT 时用这套
 // （间隔 6.5/5/6/6.5 小时，都小于 8 小时上限）。
 const DEFAULT_CYCLE_AT = "01:30,08:00,13:00,19:00";
 
@@ -296,9 +297,9 @@ function nextSlot(now, tz, slots, jitter) {
 }
 
 function cfg(env) {
-  // 轮转默认关：只有显式 INSTABOX_CYCLE=1（on/true/yes）才启用。
-  // 没开时 INSTABOX_CYCLE_AT / PEAK_HOURS 配了也不生效，时间点表直接作废。
-  const cycleOn = parseAutoResume(env.INSTABOX_CYCLE, false);
+  // 轮转默认开：只有显式 INSTABOX_CYCLE=0（off/false/no）才关。
+  // 关掉时 INSTABOX_CYCLE_AT / PEAK_HOURS 配了也不生效，时间点表直接作废。
+  const cycleOn = parseAutoResume(env.INSTABOX_CYCLE, true);
   // 时间点优先级：手写 CYCLE_AT > 高峰自动排 > DEFAULT_CYCLE_AT。
   const peaks = parsePeaks(env.INSTABOX_PEAK_HOURS);
   const manualAt = parseCycleAt(env.INSTABOX_CYCLE_AT);
@@ -312,7 +313,7 @@ function cfg(env) {
       : "";
   if (!cycleOn && (manualAt.length || peaks.length)) {
     cycleWarning =
-      "INSTABOX_CYCLE_AT / INSTABOX_PEAK_HOURS 已配置，但 INSTABOX_CYCLE 没开：要显式设 INSTABOX_CYCLE=1 才会按时间点轮转";
+      "INSTABOX_CYCLE_AT / INSTABOX_PEAK_HOURS 已配置，但 INSTABOX_CYCLE=0 把轮转关了：要按时间点轮转请删掉这行或改成 1";
   }
   const base = {
     api: (env.INSTABOX_API_URL || API_DEFAULT).replace(/\/+$/, ""),
@@ -321,7 +322,7 @@ function cfg(env) {
     kv: env.LOG || null,
     // 被平台挂起后光续租没用，默认自愈：409 machine_not_running → resume/start → 再续租
     autoResume: parseAutoResume(env.INSTABOX_AUTO_RESUME ?? "1", true),
-    // 快撞 max run time 时主动睡一觉再醒（默认关，必须显式 INSTABOX_CYCLE=1），提前量默认 20 分钟
+    // 快撞 max run time 时主动睡一觉再醒（默认开，INSTABOX_CYCLE=0 可关），提前量默认 20 分钟
     cycle: cycleOn,
     cycleMarginMin: clampMargin(env.INSTABOX_CYCLE_MARGIN_MIN, 20),
     // 定时轮转：手写时间点优先；没写但配了高峰时段，就按高峰自动排；都没有就用默认表
@@ -408,7 +409,7 @@ function accountsOf(env, base) {
     const acctAtAll = at ? parseCycleAt(at) : pk ? autoSlots(peaks) : base.cycleAtAll;
     let acctWarning = pk && !at && !autoSlots(peaks).length ? "高峰时段太满：排不出间隔 < 8 小时的时间表" : base.cycleWarning;
     if (!acctCycle && (at || pk)) {
-      acctWarning = `INSTABOX_CYCLE_AT${n === 1 ? "" : `_${n}`} / INSTABOX_PEAK_HOURS${n === 1 ? "" : `_${n}`} 已配置，但 CYCLE 没开：要显式设 INSTABOX_CYCLE${n === 1 ? "" : `_${n}`}=1 才会按时间点轮转`;
+      acctWarning = `INSTABOX_CYCLE_AT${n === 1 ? "" : `_${n}`} / INSTABOX_PEAK_HOURS${n === 1 ? "" : `_${n}`} 已配置，但 INSTABOX_CYCLE${n === 1 ? "" : `_${n}`}=0 把轮转关了：要按时间点轮转请删掉这行或改成 1`;
     }
     accounts.push({
       account: n,

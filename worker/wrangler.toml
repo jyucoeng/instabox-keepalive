@@ -18,12 +18,11 @@ INSTABOX_LEASE_TTL = "900"
 INSTABOX_LOG_MODE = "hourly"
 # 机器被挂起/停掉后续租会 409 machine_not_running：默认先 resume（stopped 用 start 兜底）再续租，设 0 关掉
 INSTABOX_AUTO_RESUME = "1"
-# ── 停机检修轮转（默认关，必须显式打开）────────────────────────────────
-# 不设 INSTABOX_CYCLE 时只做「续租 + 409 自动唤醒」，绝不主动重启机器。
-# 想要定时检修，加这一行：
-# INSTABOX_CYCLE = "1"
-# 打开后：不写 INSTABOX_CYCLE_AT 就用默认时间点 01:30/08:00/13:00/19:00；写 INSTABOX_PEAK_HOURS 则自动排。
-# 注意：只写 INSTABOX_CYCLE_AT 而不写 INSTABOX_CYCLE=1 是不生效的（/status 里会有 cycleWarning 提示）。
+# ── 停机检修轮转（默认开，下面的值就是代码里的默认值）──────────────────
+# 不写 INSTABOX_CYCLE_AT 就用默认时间点 01:30/08:00/13:00/19:00；写 INSTABOX_PEAK_HOURS 则自动排。
+# 想让 Worker 回到「只续租、绝不主动重启」的行为，只加这一行：
+# INSTABOX_CYCLE = "0"
+# 注意：CYCLE=0 时 INSTABOX_CYCLE_AT 配了也不生效（/status 里会有 cycleWarning 提示）。
 #
 # 兜底：剩多少分钟就开始轮转（机器多要调大，至少 cron 间隔 × 机器数，每轮只转一台）
 # INSTABOX_CYCLE_MARGIN_MIN = "20"
