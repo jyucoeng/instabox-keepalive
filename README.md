@@ -13,7 +13,7 @@ InstaBox 的免费机器有两条限制：
 | --- | --- | --- |
 | 空闲 30 分钟被休眠 | 每 5 分钟续一次租（TTL 900 秒） | 不用，部署完就生效 |
 | 机器被挂起/停掉 | 续租收到 `409 machine_not_running` 时自动 `resume` | 不用，默认开 |
-| 跑满 8 小时被强制挂起 + 冷却 | 到点前自己 `suspend → resume`，计时清零 | 不用，默认开（`INSTABOX_CYCLE=0` 可关） |
+| 跑满 8 小时被强制挂起 + 冷却 | 到点前自己 `suspend → resume`，计时清零 | 要，默认关，设 `INSTABOX_CYCLE=1` 才开 |
 
 代码只有两个文件：`worker/worker.js`（全部逻辑）、`worker/wrangler.toml`（CLI 部署用）。
 
@@ -74,8 +74,8 @@ curl "https://<你的worker>.workers.dev/status?token=<你的TOKEN>"
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `INSTABOX_CYCLE` | `1`（开） | **默认开**。只有显式设 `0`（或 `off` / `false` / `no`）才关掉轮转，回到「只续租 + 409 自动唤醒」 |
-| `INSTABOX_CYCLE_AT` | `01:30,08:00,13:00,19:00` | 固定时间点（本地时间）。**不填就用这套默认值**；填了按你写的走 |
+| `INSTABOX_CYCLE` | 空（关） | **默认关**。只有显式设 `1`（或 `on` / `true` / `yes`）才启用轮转；不设就只做「续租 + 409 自动唤醒」 |
+| `INSTABOX_CYCLE_AT` | `01:30,08:00,13:00,19:00` | 固定时间点（本地时间）。**只在 `INSTABOX_CYCLE=1` 时生效**；开了又不填就用这套默认值，填了按你写的走 |
 | `INSTABOX_PEAK_HOURS` | 空 | 只给高峰时段（如 `10-12,14-18,20-23`），自动排重启点。`CYCLE_AT` 优先于它 |
 | `INSTABOX_CYCLE_TZ` | `Asia/Shanghai` | 时间点按哪个时区算 |
 | `INSTABOX_CYCLE_WINDOW_MIN` | `30` | 到点后多少分钟内允许触发（`*/5` → 6 次机会） |
@@ -126,15 +126,15 @@ curl "https://<你的worker>.workers.dev/status?token=<你的TOKEN>"
 
 | 策略 | 怎么配 | 结果 |
 | --- | --- | --- |
-| **定时检修**（默认） | 什么都不加，或写 `INSTABOX_CYCLE_AT=...` | 在时间点停 10–30 秒，永远不进冷却 |
-| **不干预** | `INSTABOX_CYCLE=0` | 每 8 小时停 10 分钟 + 最多一个 cron 间隔 |
-| **不干预但保留配置** | `INSTABOX_CYCLE=0` + 保留 `CYCLE_AT` | 同上，配置留着方便以后再开 |
+| **定时检修** | `INSTABOX_CYCLE=1`（可再写 `INSTABOX_CYCLE_AT=...`） | 在时间点停 10–30 秒，永远不进冷却 |
+| **不干预**（默认） | 什么都不加 | 每 8 小时停 10 分钟 + 最多一个 cron 间隔 |
+| **不干预但保留配置** | 不设 `INSTABOX_CYCLE` + 保留 `CYCLE_AT` | 同上，配置留着方便以后再开 |
 
-> **升级注意**：旧版本默认不轮转，现在默认轮转。如果你升级后不想要任何主动重启，记得显式加 `INSTABOX_CYCLE=0`。
+> **升级注意**：现在轮转默认**关**。要定时检修必须显式加 `INSTABOX_CYCLE=1`；只写 `INSTABOX_CYCLE_AT` 不会生效（`/status` 里会给出 `cycleWarning` 提示）。
 
 ### 开法 A：固定时间点
 
-`INSTABOX_CYCLE_AT` 不写时用默认值 `01:30,08:00,13:00,19:00`（间隔 6.5/5/6/6.5 小时，都小于 8 小时上限）。想换成别的时间点：
+先设 `INSTABOX_CYCLE=1` 打开轮转。此时 `INSTABOX_CYCLE_AT` 不写就用默认值 `01:30,08:00,13:00,19:00`（间隔 6.5/5/6/6.5 小时，都小于 8 小时上限）。想换成别的时间点：
 
 ```toml
 INSTABOX_CYCLE_AT = "01:30,08:00,13:00,19:00"   # 本地时间，逗号分隔
@@ -274,7 +274,7 @@ GET /release?token=xxx             放掉租约
 
 **机器上有必须连续跑 8 小时以上的任务怎么办？**
 
-把 `INSTABOX_CYCLE` 设成 `0`（或删掉 `CYCLE_AT`），或者升级付费版（`maxRunMinutes = -1`，不限）。
+删掉 `INSTABOX_CYCLE`（默认就是关），或者升级付费版（`maxRunMinutes = -1`，不限）。
 
 ## 九、CLI 部署（可选）
 
