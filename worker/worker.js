@@ -58,7 +58,7 @@
 // 脚本版本号：改了行为就往上走一位，/status 和 /accounts 都会带出来，
 // 线上跑的是哪一版一眼可见（不用去翻 Cloudflare 的部署历史）。
 // 规则：MAJOR = 机制变了（会影响别人怎么用）；MINOR = 行为/默认值变了；PATCH = 只改文案或注释。
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
@@ -676,6 +676,7 @@ async function cycleThenLease(c, m) {
 }
 
 const holdKey = (id) => `hold:${id}`;
+const cycleKey = (id) => `cycle:${id}`;
 
 const noMachine = (acc) =>
   acc.machine.length ? `找不到机器 ${acc.machine.join("、")}（或 key 没权限）` : "这把 key 名下没有机器";
@@ -767,6 +768,7 @@ async function keepaliveAccount(acc, budget) {
           results.push({
             ...base,
             ok: lr.ok,
+            cycled: false,
             expiresAt: lr.json?.expiresAt,
             deferred: true,
             trigger,
@@ -777,22 +779,29 @@ async function keepaliveAccount(acc, budget) {
           continue;
         }
         if (budget) budget.cycles += 1;
+        const cycled = await cycleThenLease(acc, m);
+        if (cycled.cycled && acc.kv) {
+          // 轮转成功的持久痕迹：cron 抢跑时也能事后追溯「谁在什么时候转过」
+          try {
+            await acc.kv.put(cycleKey(m.id), JSON.stringify({ at: new Date().toISOString(), trigger }), { expirationTtl: 604800 });
+          } catch (_) {}
+        }
         results.push({
           ...base,
           ...view,
           trigger,
           ...(dueBySlot && slot ? { slotAt: slot.at, jitterMin: slot.jitterMin } : {}),
-          ...(await cycleThenLease(acc, m)),
+          ...cycled,
         });
         continue;
       }
 
       const r = await lease(acc, m.id);
       if (r.ok) {
-        results.push({ ...base, ok: true, expiresAt: r.json?.expiresAt, ...view });
+        results.push({ ...base, ok: true, cycled: false, trigger: "", expiresAt: r.json?.expiresAt, ...view });
       } else if (acc.autoResume && isNotRunning(r)) {
         // 被挂起了：续租是空转，先把它弄醒再续
-        results.push({ ...base, ...view, ...(await wakeThenLease(acc, m)) });
+        results.push({ ...base, cycled: false, trigger: "", ...view, ...(await wakeThenLease(acc, m)) });
       } else {
         results.push({ ...base, ok: false, status: r.status, error: r.text.slice(0, 200), ...view });
       }
@@ -871,6 +880,13 @@ async function status(c, account) {
       const ms = [];
       for (const m of list) {
         const r = await call(acc, "GET", `/v1/machines/${m.id}`);
+        let lastCycleAt = null;
+        if (acc.kv) {
+          try {
+            const rec = await acc.kv.get(cycleKey(m.id));
+            if (rec) lastCycleAt = JSON.parse(rec).at ?? null;
+          } catch (_) {}
+        }
         ms.push(
           r.ok
             ? {
@@ -880,6 +896,7 @@ async function status(c, account) {
                 autoSuspendAfterSeconds: r.json?.autoSuspendAfterSeconds,
                 autoSuspendedAt: r.json?.autoSuspendedAt ?? null,
                 ...maxRunView(r.json, Date.now()),
+                lastCycleAt,
                 nextCycleAt: nextSlot(Date.now(), acc.cycleTz, acc.cycleAt, acc.cycleJitterMin),
                 cycleAt: cycleAtText(acc.cycleAt) || null,
                 cycleTz: acc.cycleAt.length ? acc.cycleTz : null,
