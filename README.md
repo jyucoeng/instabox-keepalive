@@ -30,7 +30,7 @@ InstaBox 免费机有两条硬规矩，续租只能解决第一条：
 
 不用装 wrangler。
 
-**只要两步就能跑**，其余全有默认值。
+**最少 4 步**，其余全有默认值。
 
 1. **建 Worker + 贴代码**：面板 → `Workers & Pages` → `Create` → `Worker` → 起名 → `Deploy`
    → `Edit code`，把 `worker/worker.js` 全文覆盖进去 → `Deploy`
@@ -38,10 +38,12 @@ InstaBox 免费机有两条硬规矩，续租只能解决第一条：
    `INSTABOX_API_KEY` = 你的 `ibk_...`（多个账号再加 `INSTABOX_API_KEY_2` / `_3`）
 3. **加定时**：`Settings` → `Triggers` → `Cron Triggers`，填 `*/5 * * * *`
    > `*/5` 是按钟表对齐的（`:00/:05/:10…`），不是"上次跑完 +5 分钟"。
+4. **加口令**：存一条 Secret `TOKEN` = 随机串（`openssl rand -hex 16`）。
+   > 不配也能跑，但接口就只能靠 `INSTABOX_ANON=readonly` 挡一下，没有真正的鉴权。
+   > 你的 worker 域名是公开的，任何人都能试。
 
-到这里就能保活了。下面两个是加分项：
+到这里就完整了。最后这一项是可选的：
 
-4. **（建议）加口令**：存一条 Secret `TOKEN` = 随机串（`openssl rand -hex 16`）。
 5. **（可选）绑 KV 看日志**：`Storage & Databases` → `KV` → 建 namespace，回 Worker 的 `Bindings` 加绑定，**变量名必须叫 `LOG`**。不绑也能跑，只是 `/log` 是空的。
 
 > **不需要配任何 `INSTABOX_CYCLE_*` / `INSTABOX_LEASE_TTL` / `INSTABOX_ANON`。**
@@ -208,7 +210,7 @@ INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
-| `TOKEN` | 空 | 配了之后所有请求带 `?token=`，错了返回 `401` |
+| `TOKEN` | 空 | **必填**。配了之后所有请求带 `?token=`，错了返回 `401` |
 | `INSTABOX_ANON` | `readonly` | **只在没配 `TOKEN` 时生效**：`readonly` 只放 `/status` `/accounts` `/log`（挡住能触发写操作的 `/` 和 `/release`）、`open` 全放行（v1.2.0 及以前的行为）、`closed` 全 `403` |
 
 不配 `TOKEN` 也能跑（和旧版一致），但任何人知道域名就能触发续租/释放、刷光 KV 日志额度。建议配上。
@@ -305,11 +307,12 @@ GET /release?token=xxx     放掉租约
 
 真要配之前先问自己：是不是遇到了表里"什么时候才需要动"描述的情况？没遇到就别动。
 
-### 必填（就这 1 个）
+### 必填（2 个）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `INSTABOX_API_KEY` | — | **必填**，`ibk_...`，存 Secret。多账号再加 `INSTABOX_API_KEY_2` / `_3` |
+| `TOKEN` | 空 | **必填**，访问口令，自己定一串随机值（`openssl rand -hex 16`）。技术上不配也能跑，但那样只靠 `INSTABOX_ANON=readonly` 兜底，等于没有真正的鉴权 |
 
 ### 一般不用动（默认值就是推荐值）
 
