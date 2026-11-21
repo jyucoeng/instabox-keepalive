@@ -11,7 +11,7 @@
 // 检修轮转默认开：只有显式 INSTABOX_CYCLE=0（或 off/false/no）才关掉。
 // 关掉时 INSTABOX_CYCLE_AT / INSTABOX_PEAK_HOURS / INSTABOX_CYCLE_MARGIN_MIN 一律不生效，
 // Worker 只做「续租 + 409 自动唤醒」。
-// 默认开的情况下：INSTABOX_CYCLE_AT 不写就用 DEFAULT_CYCLE_AT（01:30/08:00/13:00/19:00），
+// 默认开的情况下：INSTABOX_CYCLE_AT 不写就用 DEFAULT_CYCLE_AT（01:30/13:00），
 // 写了 INSTABOX_PEAK_HOURS 就按高峰自动排，两者都写则 CYCLE_AT 优先。
 //
 // 每个账号还可以单独覆盖 INSTABOX_MACHINE_2 / INSTABOX_LEASE_2 /
@@ -55,13 +55,19 @@
 //   INSTABOX_CYCLE_HOLD_SEC    主动轮转时 suspend 后停几秒再 resume（默认 0-0，上限 300）
 //   INSTABOX_WAKE_JITTER_MIN   平台冷却结束后再随机等几分钟才唤醒（默认 0-0）
 // 注意：平台那 约 14 分钟冷却本身改不了（服务端行为），能加的只是"结束后多等一会儿"。
+// 脚本版本号：改了行为就往上走一位，/status 和 /accounts 都会带出来，
+// 线上跑的是哪一版一眼可见（不用去翻 Cloudflare 的部署历史）。
+// 规则：MAJOR = 机制变了（会影响别人怎么用）；MINOR = 行为/默认值变了；PATCH = 只改文案或注释。
+const VERSION = "1.2.0";
+
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 900; // 要比 cron 间隔大；*/5 下 300 正好卡在边界，900 有 3 倍余量
-// 检修轮转的默认时间表：没写 INSTABOX_CYCLE_AT 时用这套
-// （四个点之间最远 6.5 小时，远大于 2 小时上限 —— 所以真正保命的是 MARGIN 兜底，
-//  这四个点只是把轮转时刻锚定在固定整点，别当主力）。
-const DEFAULT_CYCLE_AT = "01:30,08:00,13:00,19:00";
+// 轮转的默认时间表：没写 INSTABOX_CYCLE_AT 时用这套。
+// 两个点之间隔 11.5 小时，远大于 2 小时上限 —— 真正保命的是 MARGIN 兜底（每 100 分钟一轮），
+// 这两个点只负责把漂移的轮转时刻拉回 01:30 / 13:00 两个整点，别当主力。
+// 一天实际轮转 16 次：01:30、13:00 两次锚点 + 14 次兜底，每次中断 2-3 秒。
+const DEFAULT_CYCLE_AT = "01:30,13:00";
 
 function clampTtl(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
@@ -979,7 +985,7 @@ function accountsView(c) {
 export default {
   async scheduled(_event, env) {
     const out = await keepalive(cfg(env));
-    if (out.ok) console.log("instabox-keepalive:", JSON.stringify(out));
+    if (out.ok) console.log(`instabox-keepalive v${VERSION}:`, JSON.stringify(out));
     else console.error("instabox-keepalive:", JSON.stringify(out));
   },
 
@@ -1058,8 +1064,12 @@ export default {
 };
 
 function reply(body, status, asText) {
+  // 所有 JSON 响应都带上版本号，text 模式第一行也打，方便一眼确认线上跑的是哪一版
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    body = { version: VERSION, ...body };
+  }
   if (asText) {
-    const lines = [`ok=${body.ok}`];
+    const lines = [`v${VERSION}`, `ok=${body.ok}`];
     if (body.error) lines.push(`error=${body.error}`);
     for (const a of body.accounts || []) {
       if (a.key) {
