@@ -82,7 +82,7 @@ curl "https://<你的worker>.workers.dev/log?token=<你的TOKEN>"
 
 几个要点：
 
-- **停多久**：每台 10–30 秒。默认 `CYCLE_HOLD_SEC=0`，就是"确认睡下立刻叫醒"。进程通常保留（`runtime.processesPreserved`）
+- **停多久**：每台 **2.4–3.0 秒**（实测：`Paused` 与 `Resumed` 两个请求的时间戳之差）。默认 `CYCLE_HOLD_SEC=0`，就是"确认睡下立刻叫醒"。进程保留（`runtime.processesPreserved: true`），所以 `Resumed` 之后 `runStartedAt` 和 `readyAt` 只差不到 1 毫秒——叫醒即就绪，不用等它重新加载
 - **多台错峰**：一次 cron 只轮转一台（一轮约 20 个子请求，免费版单次上限 50）。3 台就是 19:00 / 19:05 / 19:10
 - **兜底**：某个点没赶上（正在部署、Worker 抖动），剩余时间掉到 20 分钟时会立刻补一次
 - **手动触发**：`GET /?token=xxx` 走同一套判断，想立刻轮不用等 cron
