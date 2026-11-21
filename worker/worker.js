@@ -58,7 +58,7 @@
 // 脚本版本号：改了行为就往上走一位，/status 和 /accounts 都会带出来，
 // 线上跑的是哪一版一眼可见（不用去翻 Cloudflare 的部署历史）。
 // 规则：MAJOR = 机制变了（会影响别人怎么用）；MINOR = 行为/默认值变了；PATCH = 只改文案或注释。
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
@@ -997,15 +997,16 @@ export default {
 
     // 配了 TOKEN 就一律校验 —— 和旧版完全一致，升级不用改任何变量。
     // 没配 TOKEN 时按 INSTABOX_ANON 降级，默认 open = 旧版行为（全部放行）：
-    //   open（默认）  照旧全部放行，等价于旧版
-    //   readonly      只放行 /status /accounts /log，挡住 / 和 /release
-    //   closed        全部 403
+    //   readonly（默认）只放行 /status /accounts /log，挡住 / 和 /release
+    //   open            照旧全部放行（v1.2.0 及以前的行为，等于完全不设防）
+    //   closed          全部 403
+    // 默认从 open 收紧到 readonly：没配 TOKEN 时至少挡住能触发写操作的 / 和 /release。
     if (env.TOKEN) {
       if (url.searchParams.get("token") !== env.TOKEN) {
         return reply({ ok: false, error: "token 不对" }, 401, asText);
       }
     } else {
-      const anon = String(env.INSTABOX_ANON ?? "open").trim().toLowerCase();
+      const anon = String(env.INSTABOX_ANON ?? "readonly").trim().toLowerCase();
       if (anon === "closed") {
         return reply({ ok: false, error: "没配 TOKEN（INSTABOX_ANON=closed），接口已关闭" }, 403, asText);
       }
