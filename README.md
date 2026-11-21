@@ -106,11 +106,7 @@ INSTABOX_CYCLE_TZ = "Asia/Shanghai"
 **前提**：上限只有 2 小时，所以任何"一天只放几个点"的方案都盖不住整个周期 ——
 保活永远靠 `MARGIN` 兜底（每 100 分钟一轮），这些点只决定"额外的轮转落在哪个整点"。
 
-| 配置 | 实际效果 |
-| --- | --- |
-| `01:30,13:00`（默认） | 一天 16 次轮转：2 次锚点 + 14 次兜底，见下面的整日表 |
-| `01:30`（只留一个） | 每天只锚定一次，其余全交给兜底，断线时刻基本漂移 |
-| 留空 `""` | 回落到默认两个点（空串不会真的"不定时"） |
+默认值 `01:30,13:00` 就是推荐值，**这一项你不需要改**。往下看整日表就知道为什么。
 
 想减少轮转次数，改的是 `INSTABOX_CYCLE_MARGIN_MIN`（提前量越小轮得越少、但越贴近上限），
 不是删时间点。
@@ -209,29 +205,65 @@ INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"
 
 ### 多账号
 
-**第 N 个账号 = 变量名加 `_N` 后缀**，加账号就是多存一个 Secret：
+**规则一句话**：第 N 个账号 = 变量名加 `_N` 后缀。加账号就是多存一个 Secret，别的都不用动。
 
-| 1 号 | 2 号 |
+#### 3 个账号长这样（就是这个项目当前的配置）
+
+在 `Settings → Variables and Secrets` 里，一共 4 条 Secret：
+
+| 变量名 | 类型 | 值 | 对应 |
+| --- | --- | --- | --- |
+| `INSTABOX_API_KEY` | Secret | `ibk_1a2b3c4d…` | 第 1 个 InstaBox 账号的 key |
+| `INSTABOX_API_KEY_2` | Secret | `ibk_5e6f7a8b…` | 第 2 个账号的 key |
+| `INSTABOX_API_KEY_3` | Secret | `ibk_9c0d1e2f…` | 第 3 个账号的 key |
+| `TOKEN` | Secret | `••••••••••••••` | 访问口令，自己定 |
+
+可选第 5 条：KV 绑定 `LOG`（看日志用，不绑也能跑）。
+
+里面没有一个 `INSTABOX_CYCLE_*`——那些全走默认值。
+
+#### 想加到 4 个、5 个、10 个账号
+
+**加一行就行**，表里照抄：
+
+| 你要几个账号 | 需要增加的变量 | Secret 总数（含 TOKEN） |
+| --- | --- | --- |
+| 1 个 | `INSTABOX_API_KEY` | 2 |
+| 2 个 | 再加 `INSTABOX_API_KEY_2` | 3 |
+| **3 个** | 再加 `INSTABOX_API_KEY_3` | **4** ← 当前 |
+| 4 个 | 再加 `INSTABOX_API_KEY_4` | 5 |
+| 5 个 | 再加 `INSTABOX_API_KEY_5` | 6 |
+| 10 个 | 一直加到 `INSTABOX_API_KEY_10` | 11 |
+| N 个 | 一直加到 `INSTABOX_API_KEY_N` | N + 1 |
+
+具体到 5 个账号的样子：
+
+| 变量名 | 值 |
 | --- | --- |
-| `INSTABOX_API_KEY` | `INSTABOX_API_KEY_2` |
-| `INSTABOX_MACHINE` | `INSTABOX_MACHINE_2` |
-| `INSTABOX_CYCLE_AT` | `INSTABOX_CYCLE_AT_2` |
+| `INSTABOX_API_KEY` | `ibk_1a2b3c4d…`（账号 1） |
+| `INSTABOX_API_KEY_2` | `ibk_5e6f7a8b…`（账号 2） |
+| `INSTABOX_API_KEY_3` | `ibk_9c0d1e2f…`（账号 3） |
+| `INSTABOX_API_KEY_4` | `ibk_你的第4个key…`（账号 4） |
+| `INSTABOX_API_KEY_5` | `ibk_你的第5个key…`（账号 5） |
+| `TOKEN` | `••••••••••••••` |
 
-规则：
+#### 别踩的坑
 
-- 带后缀的优先，没写的继承全局值
-- **`INSTABOX_MACHINE` 也会继承** —— 两个账号机器名不同时，记得单独写 `_2`
-- 编号可以不连续（只配 `_2` 也能跑），`_1` 等同不带后缀
-- 同一把 key 配两次只续一次；某个账号 key 失效不影响其它
+- **编号可以不连续**：只配 `_2` 和 `_3`、跳过 `_1` 也能跑（`_1` 等同不带后缀）
+- **`INSTABOX_MACHINE` 会被继承**：两个账号机器名不同时，记得单独写 `INSTABOX_MACHINE_2`，
+  否则 2 号账号会用 1 号的机器名去找机器
+- **同一把 key 配两次只续一次**，不会重复轮转
+- **某个账号 key 失效不影响其它账号**，日志里会单独标 `FAIL`
+- 账号多了注意排队：每轮 cron 只轮一台，N 台同时到期时要 `(N−1)×5` 分钟。
+  3 台还剩 10 分钟余量，4 台剩 5 分钟，**5 台以上要自己算一下 `INSTABOX_CYCLE_MARGIN_MIN`**
 
-三把 key、其余全默认，面板上就这几条：
+#### 验证
 
-| 变量 | 类型 |
-| --- | --- |
-| `INSTABOX_API_KEY` / `_2` / `_3` | Secret |
-| `TOKEN` | Secret |
+```sh
+curl "https://<你的worker>/accounts?token=<你的TOKEN>"
+```
 
-`/accounts?token=...` 看到 `#1` `#2` `#3` 三行（key 打码）就说明都认到了。
+看到 `#1` `#2` `#3` 三行（key 已打码）就说明都认到了。
 
 ### 安全
 
