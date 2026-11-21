@@ -221,7 +221,11 @@ INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"
 
 ### 3 个账号长这样（就是这个项目当前的配置）
 
-在 `Settings → Variables and Secrets` 里，一共 4 条 Secret：
+Cloudflare 面板 `Settings → Variables and Secrets` 里的实际样子（key 已打码）：
+
+![3 个账号的 Variables and Secrets 面板](docs/settings-3-accounts.png)
+
+一共 4 条 Secret：
 
 | 变量名 | 类型 | 值 | 对应 |
 | --- | --- | --- | --- |
