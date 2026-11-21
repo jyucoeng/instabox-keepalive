@@ -36,15 +36,15 @@
 // 得先唤醒：自动 POST /resume（stopped 的用 /start 兜底）→ 等 running → 再续租。
 // INSTABOX_AUTO_RESUME=0 可以关掉这个自愈。
 //
-// max run time：免费机固定 480 分钟（8 小时），跑满会被平台强制挂起并进入 10 分钟冷却
+// max run time：免费机固定 120 分钟（2 小时），跑满会被平台强制挂起并进入 约 14 分钟冷却
 // （Machine.cooldownUntil，冷却期内所有唤醒路径都回 409 machine_cooldown）。
 // 默认轮转：连续运行剩 INSTABOX_CYCLE_MARGIN_MIN 分钟（默认 20）时，
-// 自己先 suspend 再 resume，把「连续运行」计时清零，代价是短暂暂停而不是 10 分钟停机。
-// 设成 0 就只等冷却结束再唤醒（每 8 小时停 10 分钟以上）。
+// 自己先 suspend 再 resume，把「连续运行」计时清零，代价是短暂暂停而不是 十几分钟停机。
+// 设成 0 就只等冷却结束再唤醒（每 2 小时停十几分钟）。
 //
 // 想固定重启时间段：INSTABOX_CYCLE_AT="02:00,08:00,14:00,20:00"（本地时间，逗号分隔），
 // INSTABOX_CYCLE_TZ="Asia/Shanghai" 指定时区，到点后 INSTABOX_CYCLE_WINDOW_MIN（默认 30）
-// 分钟内轮转一次，同一个点只轮转一次。时间点之间要小于 8 小时，否则还是会撞上限。
+// 分钟内轮转一次，同一个点只轮转一次。时间点之间要小于 2 小时上限，否则还是会撞上限。
 // INSTABOX_CYCLE_MARGIN_MIN=0 可以关掉「快到上限」的兜底轮转，只按时间点走。
 //
 // 不想手算时间点就配高峰时段：INSTABOX_PEAK_HOURS="10-12,14-18,20-23"，Worker 会自动
@@ -54,12 +54,13 @@
 //   INSTABOX_CYCLE_JITTER_MIN  到点后随机延迟几分钟才执行（默认 0-0）
 //   INSTABOX_CYCLE_HOLD_SEC    主动轮转时 suspend 后停几秒再 resume（默认 0-0，上限 300）
 //   INSTABOX_WAKE_JITTER_MIN   平台冷却结束后再随机等几分钟才唤醒（默认 0-0）
-// 注意：平台那 10 分钟冷却本身改不了（服务端行为），能加的只是"结束后多等一会儿"。
+// 注意：平台那 约 14 分钟冷却本身改不了（服务端行为），能加的只是"结束后多等一会儿"。
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 900; // 要比 cron 间隔大；*/5 下 300 正好卡在边界，900 有 3 倍余量
 // 检修轮转的默认时间表：没写 INSTABOX_CYCLE_AT 时用这套
-// （间隔 6.5/5/6/6.5 小时，都小于 8 小时上限）。
+// （四个点之间最远 6.5 小时，远大于 2 小时上限 —— 所以真正保命的是 MARGIN 兜底，
+//  这四个点只是把轮转时刻锚定在固定整点，别当主力）。
 const DEFAULT_CYCLE_AT = "01:30,08:00,13:00,19:00";
 
 function clampTtl(value, fallback) {
@@ -72,14 +73,14 @@ function parseAutoResume(value, fallback) {
   return !["0", "false", "off", "no"].includes(String(value).trim().toLowerCase());
 }
 
-// 主动轮转的提前量（分钟）：连续运行快到上限（免费机 8 小时）时，自己先 suspend→resume，
-// 把「连续运行」计时清零，免得被平台在整点强制挂起再吃 10 分钟冷却。
+// 主动轮转的提前量（分钟）：连续运行快到上限（免费机 2 小时）时，自己先 suspend→resume，
+// 把「连续运行」计时清零，免得被平台在整点强制挂起再吃 约 14 分钟冷却。
 function clampMargin(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
   return Number.isFinite(n) && n >= 1 && n <= 120 ? n : fallback;
 }
 
-// 定时轮转的窗口宽度（分钟）：到点后这么多分钟内允许触发（cron 9 分钟一轮，30 分钟 = 3 次机会）
+// 定时轮转的窗口宽度（分钟）：到点后这么多分钟内允许触发（cron 5 分钟一轮，30 分钟 = 6 次机会）
 function clampWindow(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
   return Number.isFinite(n) && n >= 1 && n <= 180 ? n : fallback;
@@ -114,7 +115,7 @@ function stableRand(seed, max) {
 
 const randInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 
-// "02:00,08:00,14:00,20:00" → [{h,m,minutes}]；留空 = 不定时，只按「快到 8 小时」兜底
+// "02:00,08:00,14:00,20:00" → [{h,m,minutes}]；留空 = 不定时，只按「快到上限」兜底
 function parseCycleAt(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return [];
@@ -175,7 +176,8 @@ function offPeak(peaks) {
 const inSegs = (segs, m) => segs.some((x) => m >= x.s && m < x.e);
 
 // 给定高峰时段，自动挑出「全在空档里、间隔尽量均匀」的重启点。
-// 目标：任意两次间隔 ≤ 7 小时（离 8 小时上限留 1 小时余量），次数越少越好。
+// 目标：任意两次间隔 ≤ 提前量窗口（默认 100 分钟）。这套算法最早是按 8 小时上限写的，
+// 但上限实际只有 2 小时，所以点要多到一天排满十几个，排不出来就返回空、退回「快到上限才转」。
 const slotCache = new Map();
 function autoSlots(peaks) {
   if (!peaks.length) return [];
@@ -184,9 +186,9 @@ function autoSlots(peaks) {
   if (hit) return hit;
 
   const segs = offPeak(peaks);
-  const TARGET = 420; // 7 小时
+  const TARGET = 100; // 离 2 小时上限留 20 分钟提前量
   let best = null;
-  for (let n = 2; n <= 8; n++) {
+  for (let n = 2; n <= 24; n++) {
     const step = 1440 / n;
     for (let phase = 0; phase < 1440; phase += 5) {
       const pts = [];
@@ -207,9 +209,9 @@ function autoSlots(peaks) {
     if (best && best.maxGap <= TARGET) break; // 找到满足余量的最少次数就停
   }
 
-  // 排出来的最大间隔如果还是 ≥8 小时，这套高峰定义就没法既避开高峰又不被平台挂，
+  // 排出来的最大间隔如果还是超过 TARGET，这套高峰定义就没法既避开高峰又不被平台挂，
   // 返回空让调用方退回「快到上限才转」，比给一个注定撞上限的时间表强
-  const slots = (best && best.maxGap < 480 ? best.pts : [])
+  const slots = (best && best.maxGap <= TARGET ? best.pts : [])
     .sort((a, b) => a - b)
     .map((m) => ({ h: Math.floor(m / 60), mi: m % 60, minutes: m }));
   slotCache.set(key, slots);
@@ -309,7 +311,7 @@ function cfg(env) {
   const slots = cycleOn ? slotsAll : [];
   let cycleWarning =
     !manualAt.length && peaks.length && !autoAt.length
-      ? "高峰时段太满：排不出间隔 < 8 小时的时间表，已退回「快到上限才转」"
+      ? "高峰时段太满：排不出间隔 < 2 小时的时间表，已退回「快到上限才转」"
       : "";
   if (!cycleOn && (manualAt.length || peaks.length)) {
     cycleWarning =
@@ -407,7 +409,7 @@ function accountsOf(env, base) {
     // 所以账号单独设 INSTABOX_CYCLE_2=1 时，也能拿到 base 里未经裁剪的 slotsAll。
     const acctCycle = parseAutoResume(setting(env, "CYCLE", n), base.cycle);
     const acctAtAll = at ? parseCycleAt(at) : pk ? autoSlots(peaks) : base.cycleAtAll;
-    let acctWarning = pk && !at && !autoSlots(peaks).length ? "高峰时段太满：排不出间隔 < 8 小时的时间表" : base.cycleWarning;
+    let acctWarning = pk && !at && !autoSlots(peaks).length ? "高峰时段太满：排不出间隔 < 2 小时的时间表" : base.cycleWarning;
     if (!acctCycle && (at || pk)) {
       acctWarning = `INSTABOX_CYCLE_AT${n === 1 ? "" : `_${n}`} / INSTABOX_PEAK_HOURS${n === 1 ? "" : `_${n}`} 已配置，但 INSTABOX_CYCLE${n === 1 ? "" : `_${n}`}=0 把轮转关了：要按时间点轮转请删掉这行或改成 1`;
     }
@@ -484,7 +486,7 @@ const listCache = new Map();
 async function machines(acc) {
   const cacheKey = `${acc.api}\n${acc.key}\n${acc.machine.join(",")}`;
   const hit = listCache.get(cacheKey);
-  // 缓存压到 60 秒：runStartedAt / cooldownUntil 是「快到 8 小时没有」的判断依据，不能太旧
+  // 缓存压到 60 秒：runStartedAt / cooldownUntil 是「快到上限没有」的判断依据，不能太旧
   if (hit && Date.now() - hit.at < 60_000) return hit.value;
 
   const list = [];
@@ -537,16 +539,23 @@ const lease = (c, id) =>
   call(c, "PUT", `/v1/machines/${id}/activity-leases/${c.lease}`, { ttlSeconds: c.ttl });
 
 // 409 machine_not_running：机器被平台挂起（suspended）或停掉了，续租对它是无效的
+// machine_cooldown 也归到这一类：撞上限被平台挂起后，冷却期内续租同样返回 409，
+// 冷却结束平台会切回 not_running，所以两种码都要认，别让机器在 suspended 里躺着没人管。
 const isNotRunning = (r) =>
-  r.status === 409 && /not_running|suspended|stopped/i.test(r.text || "");
+  r.status === 409 && /not_running|suspended|stopped|machine_cooldown/i.test(r.text || "");
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
-// 换状态的写操作要 Idempotency-Key（缺了 400）；key 带时间戳，重试不会撞旧 key
+// 换状态的写操作要 Idempotency-Key（缺了 400）。
+// key 按「分钟」分桶：同一分钟内的重试会复用同一个 key，平台侧幂等才真正生效；
+// 早先直接用 Date.now()，每次重试都是新 key，等于没有幂等保护，超时重发会把 suspend/resume 做两遍。
 async function act(c, id, type) {
   const res = await fetch(`${c.api}/v1/machines/${id}/${type}`, {
     method: "POST",
-    headers: { "X-API-Key": c.key, "Idempotency-Key": `ka-${type}-${id}-${Date.now()}` },
+    headers: {
+      "X-API-Key": c.key,
+      "Idempotency-Key": `ka-${type}-${id}-${Math.floor(Date.now() / 60_000)}`,
+    },
   });
   const text = await res.text();
   return { ok: res.ok, status: res.status, text };
@@ -562,7 +571,7 @@ async function stateOf(c, id) {
   return info?.state || "";
 }
 
-// max run time：免费机固定 480 分钟（8 小时），跑满会被平台强制挂起并进入冷却；
+// max run time：免费机固定 120 分钟（2 小时），跑满会被平台强制挂起并进入冷却；
 // 冷却期内所有唤醒路径都返回 409 machine_cooldown，只能用 cooldownUntil 判断什么时候能再叫醒它。
 function maxRunView(info, now) {
   const maxRun = Number.isInteger(info?.maxRunMinutes) ? info.maxRunMinutes : -1;
@@ -579,7 +588,7 @@ function maxRunView(info, now) {
 }
 
 // 挂了就先唤醒再续租：resume 优先，stopped 的用 start 兜底；running 后立刻续租一次。
-// 冷却刚结束时 resume 可能是冷启动，给 40 秒再放弃（否则要等下一轮 cron，白丢 9 分钟）。
+// 冷却刚结束时 resume 可能是冷启动，给 40 秒再放弃（否则要等下一轮 cron，白丢 5 分钟）。
 async function wakeThenLease(c, m) {
   const wake = [];
   for (const type of ["resume", "start"]) {
@@ -599,7 +608,7 @@ async function wakeThenLease(c, m) {
   return { ok: false, resumed: true, status: 409, error: "已发唤醒，机器还没 running（下一轮再续）", wake };
 }
 
-// 主动轮转：在撞上 8 小时上限之前先 suspend（连续运行计时清零），再 resume 回来并重新续租。
+// 主动轮转：在撞上 2 小时上限之前先 suspend（连续运行计时清零），再 resume 回来并重新续租。
 // 生命周期操作会让旧租约失效，所以醒来必须再 lease 一次；进程通常会被保留（runtime.processesPreserved）。
 async function cycleThenLease(c, m) {
   const wake = [];
@@ -667,6 +676,12 @@ const noMachine = (acc) =>
 
 // 一个账号：把它的机器全部续一遍；单台失败不影响同账号其它机器
 async function keepaliveAccount(acc, budget) {
+  // 多台机器同时到期时，每轮 cron 只轮转一台，排在后面的要等 (peerCount-1) 个 5 分钟 tick。
+  // 提前量自动加宽，保证最后一台轮完时离上限还有余量：
+  //   1~3 台 → 仍是 20 分钟（和以前完全一致，老用户无感）
+  //   4 台 → 25，5 台 → 30，依此类推；用户显式配了更大的值则以用户的为准
+  const peerCount = Math.max(1, Math.min(50, Number(acc.peerCount) || 1));
+  const marginMin = Math.max(acc.cycleMarginMin, 10 + (peerCount - 1) * 5);
   const { list, missing, error } = await machines(acc);
   if (error) return { account: acc.account, lease: acc.lease, ttl: acc.ttl, ok: false, error, machines: [] };
   if (!list.length) {
@@ -726,19 +741,19 @@ async function keepaliveAccount(acc, budget) {
       // 定时窗口：到点后 windowMin 分钟内，且这台机器「这个点之后还没重启过」才轮转，
       // 所以一个时间点只会触发一次，不会在窗口里反复重启
       const dueBySlot = !!(acc.cycle && slot && slot.inWindow && state === "running" && startedMs < slot.effectiveMs);
-      // 兜底：还没到时间点、但已经快到 8 小时上限了，也轮转一次（margin 设 0 可关掉）
+      // 兜底：还没到时间点、但已经快到 2 小时上限了，也轮转一次（margin 最小 1，设 0 会回落到默认 20）
       const dueByLimit = !!(
         acc.cycle &&
-        acc.cycleMarginMin > 0 &&
+        marginMin > 0 &&
         state === "running" &&
         view.remainingMinutes !== null &&
         view.remainingMinutes > 0 &&
-        view.remainingMinutes <= acc.cycleMarginMin
+        view.remainingMinutes <= marginMin
       );
       const trigger = dueBySlot ? "slot" : dueByLimit ? "limit" : "";
 
-      // 快撞 8 小时上限：先自己睡一下再醒，把连续运行计时清零，绕开平台的强制挂起 + 10 分钟冷却。
-      // 每轮 cron 只轮转一台，避免一次调用把 50 个子请求额度用光（其余下一轮 9 分钟后轮到）。
+      // 快撞 2 小时上限：先自己睡一下再醒，把连续运行计时清零，绕开平台的强制挂起 + 约 14 分钟冷却。
+      // 每轮 cron 只轮转一台，避免一次调用把 50 个子请求额度用光（其余下一轮 5 分钟后轮到）。
       if (trigger) {
         if (budget && budget.cycles >= 1) {
           // 排不上队也先把租约续上，别让这台掉出租约保护
@@ -780,11 +795,16 @@ async function keepaliveAccount(acc, budget) {
     }
   }
 
+  // coolingDown（平台按 2 小时上限挂起后的冷却）和 held（主动停机中）都是计划内的正常状态，
+  // 不算失败；否则机器一进入正常冷却，每轮 cron 都会把整轮判成失败、接口返回 502。
+  const hardFail = results.filter((r) => !r.ok && !r.coolingDown && !r.held);
   const out = {
     account: acc.account,
     lease: acc.lease,
     ttl: acc.ttl,
-    ok: results.every((r) => r.ok) && !missing.length,
+    ok: hardFail.length === 0 && !missing.length,
+    coolingDown: results.filter((r) => r.coolingDown).length,
+    held: results.filter((r) => r.held).length,
     machines: results,
   };
   if (missing.length) out.error = `找不到机器 ${missing.join("、")}`;
@@ -804,7 +824,7 @@ async function keepalive(c, opts = {}) {
   const budget = { cycles: 0 };
   for (const acc of picked) {
     try {
-      accounts.push(await keepaliveAccount(acc, budget));
+      accounts.push(await keepaliveAccount({ ...acc, peerCount: picked.length }, budget));
     } catch (e) {
       // 一个账号的异常不能拖垮其它账号
       accounts.push({ account: acc.account, lease: acc.lease, ttl: acc.ttl, ok: false, error: `续租异常：${e.message}`, machines: [] });
@@ -910,9 +930,12 @@ async function release(c, account) {
   return { ok: accounts.length > 0 && accounts.every((a) => a.ok), count: flat.length, accounts, machines: flat };
 }
 
+// 没配 TOKEN 时 INSTABOX_ANON=readonly 允许匿名访问的只读路由
+const ANON_READONLY = new Set(["/status", "/accounts", "/log"]);
+
 function maskKey(key) {
   if (!key) return "";
-  return key.length <= 8 ? "****" : `${key.slice(0, 4)}…${key.slice(-4)}`;
+  return key.length <= 8 ? "****" : `…${key.slice(-4)}`;
 }
 
 function accountsView(c) {
@@ -964,11 +987,31 @@ export default {
     const c = cfg(env);
     const url = new URL(request.url);
     const asText = url.searchParams.get("format") === "text";
-    if (env.TOKEN && url.searchParams.get("token") !== env.TOKEN) {
-      return reply({ ok: false, error: "token 不对" }, 401, asText);
+    const route = url.pathname.replace(/\/+$/, "") || "/";
+
+    // 配了 TOKEN 就一律校验 —— 和旧版完全一致，升级不用改任何变量。
+    // 没配 TOKEN 时按 INSTABOX_ANON 降级，默认 open = 旧版行为（全部放行）：
+    //   open（默认）  照旧全部放行，等价于旧版
+    //   readonly      只放行 /status /accounts /log，挡住 / 和 /release
+    //   closed        全部 403
+    if (env.TOKEN) {
+      if (url.searchParams.get("token") !== env.TOKEN) {
+        return reply({ ok: false, error: "token 不对" }, 401, asText);
+      }
+    } else {
+      const anon = String(env.INSTABOX_ANON ?? "open").trim().toLowerCase();
+      if (anon === "closed") {
+        return reply({ ok: false, error: "没配 TOKEN（INSTABOX_ANON=closed），接口已关闭" }, 403, asText);
+      }
+      if (anon === "readonly" && !ANON_READONLY.has(route)) {
+        return reply(
+          { ok: false, error: "没配 TOKEN，只读模式只放行 /status /accounts /log" },
+          403,
+          asText,
+        );
+      }
     }
 
-    const route = url.pathname.replace(/\/+$/, "") || "/";
     const account = (url.searchParams.get("account") || "").trim();
 
     if (route === "/") {
