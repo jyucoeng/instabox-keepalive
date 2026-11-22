@@ -19,7 +19,7 @@ InstaBox 免费机有两条硬规矩，续租只能解决第一条：
 
 第二条是重点，也是最容易搞错的地方（很多地方写 8 小时，是错的）：
 
-- **上限是 2 小时**。实测：`runStartedAt` 之后正好 **120 分 00 秒**被挂，冷却 **14 分 11 秒**，期间续租和 resume 全部返回 `409 machine_cooldown`。
+- **上限是 2 小时**。实测：`runStartedAt` 之后 **120 分 10 秒**被挂（平台调度有约 10 秒粒度），冷却 **14 分钟**，期间续租和 resume 全部返回 `409 machine_cooldown`。原始日志见 [readme-evidence.md](readme-evidence.md)。
 - **保活靠的是"提前量"兜底，不是那几个整点**。默认 `INSTABOX_CYCLE_MARGIN_MIN=20`，即每 **100 分钟**必轮一次（实测间隔稳定在 5995–6001 秒）。
 
 ## 二、部署（网页面板，5 分钟）
@@ -383,7 +383,7 @@ GET /release?token=xxx     放掉租约
 | `v1.3.1` | tag `v1.3.1` | **轮转字段可观测**：`cycled` / `trigger` 在未触发、deferred、被挂自愈三个分支也显式给出 `false` / `""`（不再靠「键不存在」表达）；轮转成功后写 KV `cycle:{id}`，`/status` 回显 `lastCycleAt`；停机时长按实测改为 1.8–3.0 秒 |
 | `v1.3.0` | tag `v1.3.0` | **配置精简**：`INSTABOX_ANON` 默认值 `open` → `readonly`；面板从 14 项降到 5 项（3 把 key + `LOG` + `TOKEN`），其余全部走代码默认值 |
 | `v1.2.0` | tag `v1.2.0` | 默认锚点 `01:30,08:00,13:00,19:00` → `01:30,13:00`；响应统一带 `version`；补 `INSTABOX_ANON` 用法 |
-| `v1.1.0` | tag `v1.1.0` | **实测把上限口径从 8 小时改成 2 小时**（120 分 00 秒被挂、冷却 14 分 11 秒）；`isNotRunning` 增认 `machine_cooldown`；提前量按账号数自适应 `max(MARGIN, 10+(N-1)×5)` |
+| `v1.1.0` | tag `v1.1.0` | **实测把上限口径从 8 小时改成 2 小时**（120 分 10 秒被挂、冷却 14 分钟）；`isNotRunning` 增认 `machine_cooldown`；提前量按账号数自适应 `max(MARGIN, 10+(N-1)×5)` |
 | `v1.0.0` | tag `v1.0.0` | 初版：按 8 小时上限设计的时间点轮转 + 提前量兜底 |
 
 > `v1.0.0` 里"8 小时"的说法是错的（当时只看了文档没实测）。真实上限 120 分钟，`v1.1.0` 起全部按 2 小时算。
@@ -402,3 +402,14 @@ npx wrangler deploy
 ## 免责声明
 
 仅用于管理你自己账号下的 InstaBox 机器。Worker 能读到这些 key，能读到它们的人也能操作你的机器。
+
+---
+
+## 附：120 分钟上限的实测证据
+
+`v1.1.0` 起把上限口径从「8 小时」改成「2 小时」，依据是机器 console 里的原始日志，不是文档推测。
+
+一份完整的取证记录（原始日志行、减法算式、`409` 原文、时间线、复现命令）见 👉 **[readme-evidence.md](readme-evidence.md)**
+
+一句话结论：
+连续运行 **120 分 10 秒** 后被平台强制挂起，冷却 **14 分钟**，期间 `PUT /activity-leases/keepalive` 与 `POST /resume` 均返回 `409 machine_cooldown`。
