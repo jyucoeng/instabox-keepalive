@@ -193,15 +193,6 @@ INSTABOX_CYCLE_MARGIN_MIN = "15"    # 每 105 分钟一轮，一天约 13.7 次
 - **实际触发时刻会有 0–5 分钟误差**：cron 每 5 分钟才跑一次，落在哪个 tick 看运气（比如 03:10 可能实际 03:10 或 03:15）
 - 多台机器会错开，因为每轮 cron 只轮转一台：3 台同时到期时是 T+0 / T+5 / T+10
 
-懒得算就只报高峰时段，让它自己排：
-
-```
-INSTABOX_PEAK_HOURS = "10-12,14-18,20-23"
-```
-
-会排成 `00:00,06:00,12:00,18:00`（全在高峰外、间隔 6 小时）。`/accounts` 里能看到排出来的结果和来源（`cycleAtSource: "auto"`）。
-
-
 ### 安全
 
 | 变量 | 默认 | 作用 |
@@ -326,7 +317,6 @@ GET /release?token=xxx     放掉租约
 | `INSTABOX_API_URL` | `https://api.instabox.sh` | 换私有网关才需要改 |
 | `INSTABOX_CYCLE` | `1` | 轮转开关，**默认开** |
 | `INSTABOX_CYCLE_AT` | `01:30,13:00` | 固定时间点（锚点），`CYCLE=0` 时不生效 |
-| `INSTABOX_PEAK_HOURS` | 空 | 自动排时间表，`CYCLE_AT` 优先于它 |
 | `INSTABOX_CYCLE_TZ` | `Asia/Shanghai` | 时区 |
 | `INSTABOX_CYCLE_WINDOW_MIN` | `30` | 到点后多少分钟内允许触发 |
 | `INSTABOX_CYCLE_MARGIN_MIN` | `20` | 兜底：剩余多少分钟强制轮转；0 = 关 |
